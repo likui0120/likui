@@ -38,6 +38,9 @@ addColumn('orders', 'discount_pct', 'INTEGER'); // 90 表示 9 折
 addColumn('orders', 'discount_cents', 'INTEGER NOT NULL DEFAULT 0');
 addColumn('redemptions', 'kind', "TEXT NOT NULL DEFAULT 'school'"); // school 去学校兑换现金 / stall 拿去食堂其他档口用
 addColumn('day_closes', 'tickets_json', 'TEXT'); // 日结时清点的店内余票
+addColumn('stock_items', 'pack_qty', 'REAL'); // 规格：每个包装有多少主单位，例如 25（kg/袋）
+addColumn('stock_items', 'pack_unit', 'TEXT'); // 包装单位，例如 袋
+addColumn('stock_moves', 'ref_log_id', 'INTEGER'); // 出炉自动扣原料时对应的出品记录
 
 // ---------- 工具 ----------
 const now = () => {
@@ -98,8 +101,10 @@ if (!get(`SELECT id FROM users LIMIT 1`)) {
   ];
   sample.forEach(([c, n, p], i) => run(`INSERT INTO products (category, name, price_cents, active, sort) VALUES (?,?,?,1,?)`, c, n, p, i));
   run(`INSERT OR IGNORE INTO settings (key, value) VALUES ('shop_name',?)`, DEFAULT_SHOP);
-  run(`INSERT OR IGNORE INTO settings (key, value) VALUES ('ticket_faces','500,1000,2000')`);
+  run(`INSERT OR IGNORE INTO settings (key, value) VALUES ('ticket_faces','1000,2000')`);
 }
+// 不再收 5 元票：没改过的默认面额去掉 5 元
+run(`UPDATE settings SET value='1000,2000' WHERE key='ticket_faces' AND value='500,1000,2000'`);
 // 第一版默认店名是"药大烘焙"，没改过的话换成正式店名
 run(`UPDATE settings SET value=? WHERE key='shop_name' AND value='药大烘焙'`, DEFAULT_SHOP);
 process.title = `${getSetting('shop_name', DEFAULT_SHOP)}收银系统`; // Windows 黑色窗口的标题
@@ -214,7 +219,7 @@ route('GET', '/api/me', ANY, ({ user, req }) => {
   return {
     ...user, default_pin: user.role === 'owner' && getSetting('default_pin') === '1',
     shop_name: getSetting('shop_name', DEFAULT_SHOP), version: VERSION, query_url: queryUrl(req),
-    ticket_faces: getSetting('ticket_faces', '500,1000,2000').split(',').map(Number).filter((n) => n > 0),
+    ticket_faces: getSetting('ticket_faces', '1000,2000').split(',').map(Number).filter((n) => n > 0),
     print: { mode: pc.mode, auto: pc.auto, paper: pc.paper },
     discount: discountCfg(),
   };
@@ -283,8 +288,19 @@ route('POST', '/api/settings', OWNER, ({ user, body }) => {
 });
 
 // 商品
-route('GET', '/api/products', ANY, () => all(`SELECT p.*, COALESCE((SELECT SUM(i.qty) FROM order_items i JOIN orders o ON o.id=i.order_id
-  WHERE i.product_id=p.id AND o.status='done' AND substr(o.created_at,1,10) >= ?),0) AS sold_30d FROM products p ORDER BY active DESC, sort, id`, addDays(today(), -29)));
+route('GET', '/api/products', ANY, () => {
+  const t = today();
+  const rows = all(`SELECT p.*, COALESCE((SELECT SUM(i.qty) FROM order_items i JOIN orders o ON o.id=i.order_id
+    WHERE i.product_id=p.id AND o.status='done' AND substr(o.created_at,1,10) >= ?),0) AS sold_30d,
+    COALESCE((SELECT SUM(i.qty) FROM order_items i JOIN orders o ON o.id=i.order_id
+    WHERE i.product_id=p.id AND o.status='done' AND substr(o.created_at,1,10) = ?),0) AS sold_today,
+    (SELECT qty FROM plans WHERE date=? AND product_id=p.id) AS plan_today,
+    COALESCE((SELECT SUM(qty) FROM production_logs WHERE date=? AND product_id=p.id AND type='output'),0) AS output_today
+    FROM products p ORDER BY active DESC, sort, id`, addDays(t, -29), t, t, t);
+  const fs_ = finishedStock();
+  // 剩余待做 = 今天的生产计划 − 今天已出炉
+  return rows.map((p) => ({ ...p, stock: fs_[p.id] ?? null, todo: p.plan_today === null ? null : Math.max(0, p.plan_today - p.output_today) }));
+});
 route('POST', '/api/products', OWNER, ({ user, body }) => {
   const name = String(body.name || '').trim();
   if (!name) bad('请填写商品名');
@@ -550,69 +566,44 @@ route('POST', '/api/public/lookup', null, ({ req, body }) => {
   };
 });
 
-// 餐票库与兑换
-route('GET', '/api/tickets', OWNER, () => {
-  const pending = all(`SELECT * FROM ticket_batches WHERE redemption_id IS NULL ORDER BY COALESCE(expire_date,'9999'), id`);
-  const groups = all(`SELECT face_cents, expire_date, SUM(count) AS count FROM ticket_batches WHERE redemption_id IS NULL GROUP BY face_cents, expire_date ORDER BY COALESCE(expire_date,'9999'), face_cents`);
-  const pendingTotal = pending.reduce((s, b) => s + b.face_cents * b.count, 0);
-  const liability = get(`SELECT COALESCE(SUM(t.amount_cents),0) AS v FROM account_tx t JOIN accounts a ON a.id=t.account_id WHERE a.status='active'`).v;
-  const redemptions = all(`SELECT * FROM redemptions ORDER BY id DESC LIMIT 200`);
-  const kinds = Object.fromEntries(all(`SELECT kind, COALESCE(SUM(face_total_cents),0) AS v FROM redemptions WHERE substr(created_at,1,7)=? GROUP BY kind`, today().slice(0, 7)).map((r) => [r.kind, r.v]));
-  return { pending, groups, by_face: ticketsOnHand(), pending_total_cents: pendingTotal, liability_cents: liability, redemptions, month: { school: kinds.school || 0, stall: kinds.stall || 0 }, today: today() };
-});
-// 店里手上还有的纸质餐票（没去兑换、也没拿去其他档口用的），按面额
-function ticketsOnHand() {
-  return all(`SELECT face_cents, SUM(count) AS count FROM ticket_batches WHERE redemption_id IS NULL GROUP BY face_cents ORDER BY face_cents`);
+// 票据（纸质餐票）库存：收进来的票面合计 − 出库合计（去学校兑换、自由出库），只按金额算
+const TICKET_KIND = { school: '学校兑换', free: '自由出库', stall: '自由出库' };
+function ticketStock() {
+  const inn = get(`SELECT COALESCE(SUM(face_cents*count),0) AS v FROM ticket_batches`).v;
+  const out = get(`SELECT COALESCE(SUM(face_total_cents),0) AS v FROM redemptions`).v;
+  return inn - out;
 }
-// 拿店里收到的餐票去食堂其他档口用：按面额和张数，从最早到期的票开始扣
-route('POST', '/api/ticket-use', OWNER, ({ user, body }) => {
-  const want = Array.isArray(body.tickets) ? body.tickets.filter((k) => k && k.count) : [];
-  const face = ticketsTotal(want);
-  if (!face) bad('请选择要用的餐票');
-  const note = String(body.note || '').trim();
-  if (!note) bad('请填写用在哪个档口、买了什么');
-  return tx(() => {
-    const r = run(`INSERT INTO redemptions (created_at, face_total_cents, received_cents, note, operator_name, kind) VALUES (?,?,?,?,?, 'stall')`,
-      now(), face, face, note, user.name);
-    const rid = Number(r.lastInsertRowid);
-    for (const k of want) {
-      let need = k.count;
-      const batches = all(`SELECT * FROM ticket_batches WHERE redemption_id IS NULL AND face_cents=? ORDER BY COALESCE(expire_date,'9999'), id`, k.face_cents);
-      if (batches.reduce((s2, b) => s2 + b.count, 0) < need) bad(`店里的 ${(k.face_cents / 100)} 元票不够 ${k.count} 张`);
-      for (const b of batches) {
-        if (!need) break;
-        if (b.count <= need) {
-          run(`UPDATE ticket_batches SET redemption_id=? WHERE id=?`, rid, b.id);
-          need -= b.count;
-        } else {
-          // 一批票只用掉一部分：拆成两批
-          run(`UPDATE ticket_batches SET count=? WHERE id=?`, b.count - need, b.id);
-          run(`INSERT INTO ticket_batches (created_at, face_cents, count, expire_date, source, ref_type, ref_id, redemption_id) VALUES (?,?,?,?,?,?,?,?)`,
-            b.created_at, b.face_cents, need, b.expire_date, b.source, b.ref_type, b.ref_id, rid);
-          need = 0;
-        }
-      }
-    }
-    log(user, '餐票档口使用', { id: rid, face_total_cents: face, note });
-    return { id: rid, face_total_cents: face };
-  });
+route('GET', '/api/tickets', OWNER, () => {
+  const liability = get(`SELECT COALESCE(SUM(t.amount_cents),0) AS v FROM account_tx t JOIN accounts a ON a.id=t.account_id WHERE a.status='active'`).v;
+  const month = today().slice(0, 7);
+  const kinds = all(`SELECT kind, COALESCE(SUM(face_total_cents),0) AS v FROM redemptions WHERE substr(created_at,1,7)=? GROUP BY kind`, month);
+  const out = (k) => kinds.filter((r) => (k === 'free' ? r.kind !== 'school' : r.kind === 'school')).reduce((a, r) => a + r.v, 0);
+  const inMonth = get(`SELECT COALESCE(SUM(face_cents*count),0) AS v FROM ticket_batches WHERE substr(created_at,1,7)=?`, month).v;
+  const inToday = get(`SELECT COALESCE(SUM(face_cents*count),0) AS v FROM ticket_batches WHERE substr(created_at,1,10)=?`, today()).v;
+  return { stock_cents: ticketStock(), liability_cents: liability, month: { in: inMonth, school: out('school'), free: out('free') }, today_in_cents: inToday, today: today() };
 });
-route('POST', '/api/redemptions', OWNER, ({ user, body }) => {
-  const ids = Array.isArray(body.batch_ids) ? body.batch_ids.filter(isInt) : [];
-  if (!ids.length) bad('请选择要兑换的餐票');
-  if (!isInt(body.received_cents) || body.received_cents < 0) bad('请填写实际换回金额');
-  return tx(() => {
-    const q = ids.map(() => '?').join(',');
-    const rows = all(`SELECT * FROM ticket_batches WHERE id IN (${q}) AND redemption_id IS NULL`, ...ids);
-    if (rows.length !== ids.length) bad('有餐票已经兑换过了，请刷新');
-    const face = rows.reduce((s, b) => s + b.face_cents * b.count, 0);
-    const r = run(`INSERT INTO redemptions (created_at, face_total_cents, received_cents, note, operator_name) VALUES (?,?,?,?,?)`,
-      now(), face, body.received_cents, String(body.note || ''), user.name);
-    const rid = Number(r.lastInsertRowid);
-    run(`UPDATE ticket_batches SET redemption_id=? WHERE id IN (${q})`, rid, ...ids);
-    log(user, '餐票兑换', { id: rid, face_total_cents: face, received_cents: body.received_cents });
-    return { id: rid, face_total_cents: face };
-  });
+// 票据记录：收票（临时用票、存票纸票）和出库（学校兑换、自由出库）合在一起，按时间倒序
+route('GET', '/api/tickets/records', OWNER, ({ query }) => {
+  const to = isDate(query.to) ? query.to : today();
+  const from = isDate(query.from) ? query.from : addDays(to, -30);
+  const ins = all(`SELECT created_at, face_cents, count, source, expire_date FROM ticket_batches WHERE substr(created_at,1,10) BETWEEN ? AND ?`, from, to)
+    .map((b) => ({ created_at: b.created_at, dir: 'in', kind: b.source === 'stored' ? '存票收票' : '临时用票', amount_cents: b.face_cents * b.count, detail: `${b.face_cents / 100}元×${b.count}张${b.expire_date ? `，${b.expire_date} 到期` : ''}`, operator_name: '' }));
+  const outs = all(`SELECT * FROM redemptions WHERE substr(created_at,1,10) BETWEEN ? AND ?`, from, to)
+    .map((r) => ({ created_at: r.created_at, dir: 'out', kind: TICKET_KIND[r.kind] || r.kind, amount_cents: -r.face_total_cents, detail: r.note || '', operator_name: r.operator_name || '' }));
+  return { from, to, rows: [...ins, ...outs].sort((x, y) => (x.created_at < y.created_at ? 1 : -1)) };
+});
+// 票据出库：去学校兑换或自由出库，只填金额，从票据库存里扣
+route('POST', '/api/tickets/out', OWNER, ({ user, body }) => {
+  if (!['school', 'free'].includes(body.kind)) bad('出库类型不对');
+  if (!isInt(body.amount_cents) || body.amount_cents <= 0) bad('请填写票据金额');
+  const stock = ticketStock();
+  if (body.amount_cents > stock) bad(`票据库存只有 ${(stock / 100).toFixed(2)} 元`);
+  const note = String(body.note || '').trim();
+  if (body.kind === 'free' && !note) bad('请写一下用在哪里');
+  const r = run(`INSERT INTO redemptions (created_at, face_total_cents, received_cents, note, operator_name, kind) VALUES (?,?,?,?,?,?)`,
+    now(), body.amount_cents, body.amount_cents, note, user.name, body.kind);
+  log(user, `票据${TICKET_KIND[body.kind]}`, { amount_cents: body.amount_cents, note });
+  return { id: Number(r.lastInsertRowid), stock_cents: stock - body.amount_cents };
 });
 
 // 日结
@@ -629,15 +620,17 @@ function daySystem(date) {
   return { amounts: m, orders_by_method: n, orders: o.n, total_cents: o.total, overpay_cents: o.over, discount_cents: o.disc, paid_cents: paid, voided, deposits_cents: deposits };
 }
 function ticketFaces() {
-  const set = getSetting('ticket_faces', '500,1000,2000').split(',').map(Number).filter((n) => n > 0);
-  return [...new Set([...set, ...ticketsOnHand().map((r) => r.face_cents)])].sort((a, b) => a - b);
+  const set = getSetting('ticket_faces', '1000,2000').split(',').map(Number).filter((n) => n > 0);
+  return set.length ? set.sort((x, y) => x - y) : [1000];
 }
 route('GET', '/api/dayclose', STAFF, ({ query }) => {
   const date = isDate(query.date) ? query.date : today();
   const saved = get(`SELECT * FROM day_closes WHERE date=?`, date) || null;
-  if (saved) { try { saved.tickets = JSON.parse(saved.tickets_json || 'null'); } catch { saved.tickets = null; } }
-  const onHand = Object.fromEntries(ticketsOnHand().map((r) => [r.face_cents, r.count]));
-  return { date, today: today(), system: daySystem(date), saved, tickets_now: ticketFaces().map((f) => ({ face_cents: f, count: onHand[f] || 0 })) };
+  if (saved) {
+    try { saved.tickets = JSON.parse(saved.tickets_json || 'null'); } catch { saved.tickets = null; }
+    if (saved.tickets && saved.tickets.system_cents === undefined) saved.tickets = null; // v1.2 测试版的格式
+  }
+  return { date, today: today(), system: daySystem(date), saved, ticket_stock_cents: ticketStock(), faces: ticketFaces() };
 });
 route('POST', '/api/dayclose', STAFF, ({ user, body }) => {
   const date = isDate(body.date) ? body.date : today();
@@ -646,18 +639,15 @@ route('POST', '/api/dayclose', STAFF, ({ user, body }) => {
   const cashDiff = body.cash_actual_cents - s.amounts.cash;
   const posDiff = body.pos_actual_cents - s.amounts.pos;
   const note = String(body.note || '').trim();
-  // 店内余票：系统应有张数（按现在的餐票库）和实点张数
+  // 店内余票：按面额点张数，合计金额和票据库存对比
   let tickets = null; let ticketDiff = 0;
-  if (Array.isArray(body.tickets_actual) && body.tickets_actual.some((k) => k && k.count !== null && k.count !== undefined)) {
-    const onHand = Object.fromEntries(ticketsOnHand().map((r) => [r.face_cents, r.count]));
-    const rows = ticketFaces().map((f) => {
-      const k = body.tickets_actual.find((x) => x && x.face_cents === f);
-      const actual = k && k.count !== null && k.count !== undefined ? k.count : null;
-      if (actual !== null && (!isInt(actual) || actual < 0)) bad('余票张数不对');
-      return { face_cents: f, system: onHand[f] || 0, actual };
-    });
-    for (const r of rows) if (r.actual !== null) ticketDiff += Math.abs(r.actual - r.system);
-    tickets = { rows, at: now() };
+  const filled = Array.isArray(body.tickets_actual) ? body.tickets_actual.filter((k) => k && k.count !== null && k.count !== undefined) : [];
+  if (filled.length) {
+    for (const k of filled) if (!isInt(k.face_cents) || k.face_cents <= 0 || !isInt(k.count) || k.count < 0) bad('余票张数不对');
+    const actual = filled.reduce((a, k) => a + k.face_cents * k.count, 0);
+    const system = ticketStock();
+    ticketDiff = actual - system;
+    tickets = { rows: filled.map((k) => ({ face_cents: k.face_cents, count: k.count })), actual_cents: actual, system_cents: system, at: now() };
   } else {
     const old = get(`SELECT tickets_json FROM day_closes WHERE date=?`, date);
     if (old && old.tickets_json) tickets = JSON.parse(old.tickets_json);
@@ -723,6 +713,39 @@ route('GET', '/api/export', OWNER, ({ query, res }) => {
   return undefined;
 });
 
+// ---------- 成品库存、配方成本 ----------
+// 成品理论库存 = 累计出炉 − 累计售出 − 累计报损 + 盘点调整。从没登记过出炉、也没盘点过的商品不算库存（返回 null）
+function finishedStock() {
+  const m = new Map();
+  const add = (pid, k, v) => { if (!m.has(pid)) m.set(pid, { output: 0, sold: 0, loss: 0, adj: 0 }); m.get(pid)[k] += v; };
+  for (const r of all(`SELECT product_id, type, SUM(qty) AS q FROM production_logs WHERE type IN ('output','loss') GROUP BY product_id, type`)) add(r.product_id, r.type, r.q);
+  for (const r of all(`SELECT product_id, SUM(qty) AS q FROM product_adj GROUP BY product_id`)) add(r.product_id, 'adj', r.q);
+  const sold = Object.fromEntries(all(`SELECT i.product_id, SUM(i.qty) AS q FROM order_items i JOIN orders o ON o.id=i.order_id WHERE o.status='done' AND i.product_id IS NOT NULL GROUP BY i.product_id`).map((r) => [r.product_id, r.q]));
+  const out = {};
+  for (const [pid, v] of m) out[pid] = v.output - (sold[pid] || 0) - v.loss + v.adj;
+  return out;
+}
+// 每个商品做 1 个的原料成本（按配方和库存品现在的单价，单位：分）
+function unitCosts() {
+  const out = {};
+  for (const r of all(`SELECT b.product_id, SUM(b.qty * s.cost_cents) AS c FROM bom b JOIN stock_items s ON s.id=b.item_id GROUP BY b.product_id`)) out[r.product_id] = r.c;
+  return out;
+}
+// 出炉时按配方自动扣原料和包材
+function bomConsume(logId, productId, qty, userName) {
+  const p = get(`SELECT name FROM products WHERE id=?`, productId);
+  for (const b of all(`SELECT * FROM bom WHERE product_id=?`, productId)) {
+    run(`INSERT INTO stock_moves (item_id, created_at, type, qty, cost_cents, note, operator_name, ref_log_id) VALUES (?,?,'bom',?,NULL,?,?,?)`,
+      b.item_id, now(), -Math.round(b.qty * qty * 1000) / 1000, `出炉 ${p ? p.name : ''}×${qty}`, userName, logId);
+  }
+}
+function addProductionLog(user, date, productId, type, qty, note) {
+  const id = Number(run(`INSERT INTO production_logs (date, created_at, product_id, type, qty, note, operator_name) VALUES (?,?,?,?,?,?,?)`,
+    date, now(), productId, type, qty, note, user.name).lastInsertRowid);
+  if (type === 'output') bomConsume(id, productId, qty, user.name);
+  return id;
+}
+
 // 出品（后厨）
 route('GET', '/api/production', KITCHEN, ({ query }) => {
   const date = isDate(query.date) ? query.date : today();
@@ -736,9 +759,7 @@ route('POST', '/api/production', KITCHEN, ({ user, body }) => {
   if (!['output', 'loss', 'leftover'].includes(body.type)) bad('类型不对');
   if (!get(`SELECT 1 FROM products WHERE id=?`, body.product_id)) bad('商品不存在');
   if (!isInt(body.qty) || body.qty <= 0) bad('数量不对');
-  const r = run(`INSERT INTO production_logs (date, created_at, product_id, type, qty, note, operator_name) VALUES (?,?,?,?,?,?,?)`,
-    date, now(), body.product_id, body.type, body.qty, String(body.note || ''), user.name);
-  return { id: Number(r.lastInsertRowid) };
+  return tx(() => ({ id: addProductionLog(user, date, body.product_id, body.type, body.qty, String(body.note || '')) }));
 });
 // 后厨登记新品：同时加到商品里（设置页能看到、收银能卖）
 route('POST', '/api/production/new-product', KITCHEN, ({ user, body }) => {
@@ -753,8 +774,7 @@ route('POST', '/api/production/new-product', KITCHEN, ({ user, body }) => {
   return tx(() => {
     const sort = get(`SELECT COALESCE(MAX(sort),0)+1 AS s FROM products`).s;
     const pid = Number(run(`INSERT INTO products (name, category, price_cents, active, sort) VALUES (?,?,?,1,?)`, name, cat, body.price_cents, sort).lastInsertRowid);
-    run(`INSERT INTO production_logs (date, created_at, product_id, type, qty, note, operator_name) VALUES (?,?,?,?,?,?,?)`,
-      date, now(), pid, body.type, body.qty, String(body.note || ''), user.name);
+    addProductionLog(user, date, pid, body.type, body.qty, String(body.note || ''));
     log(user, '后厨新增商品', { name, category: cat, price_cents: body.price_cents });
     return { product_id: pid };
   });
@@ -763,55 +783,107 @@ route('POST', '/api/production/:id/delete', KITCHEN, ({ user, params }) => {
   const l = get(`SELECT * FROM production_logs WHERE id=?`, Number(params.id));
   if (!l) bad('记录不存在');
   if (user.role !== 'owner' && l.date !== today()) bad('只能删除当天的记录');
-  run(`DELETE FROM production_logs WHERE id=?`, l.id);
+  tx(() => {
+    run(`DELETE FROM stock_moves WHERE ref_log_id=?`, l.id); // 出炉自动扣的原料退回
+    run(`DELETE FROM production_logs WHERE id=?`, l.id);
+  });
   log(user, '删除出品记录', l);
   return { ok: true };
 });
 
-// 盘存（原料、包材、成品）
+// 盘存：原料、包材（库存品）+ 成品（就是商品，按商品分类）
 const stockQty = `COALESCE((SELECT SUM(qty) FROM stock_moves m WHERE m.item_id=s.id),0)`;
-route('GET', '/api/stock', KITCHEN, () => ({
-  items: all(`SELECT s.*, ${stockQty} AS qty FROM stock_items s ORDER BY s.active DESC, s.kind, s.name`),
-  moves: all(`SELECT m.*, s.name, s.unit FROM stock_moves m JOIN stock_items s ON s.id=m.item_id ORDER BY m.id DESC LIMIT 200`),
-}));
-route('POST', '/api/stock/items', KITCHEN, ({ user, body }) => {
+route('GET', '/api/stock', KITCHEN, () => {
+  const fs_ = finishedStock(); const uc = unitCosts();
+  const today_ = today();
+  const plan = Object.fromEntries(all(`SELECT product_id, qty FROM plans WHERE date=?`, today_).map((r) => [r.product_id, r.qty]));
+  return {
+    items: all(`SELECT s.*, ${stockQty} AS qty FROM stock_items s ORDER BY s.active DESC, s.kind, s.name`),
+    products: all(`SELECT id, name, category, price_cents, active FROM products WHERE active=1 ORDER BY category, sort, id`)
+      .map((p) => ({ ...p, qty: fs_[p.id] ?? null, unit_cost: uc[p.id] ?? null, plan_today: plan[p.id] ?? null })),
+    moves: all(`SELECT m.*, s.name, s.unit FROM stock_moves m JOIN stock_items s ON s.id=m.item_id ORDER BY m.id DESC LIMIT 200`),
+    adjs: all(`SELECT a.*, p.name FROM product_adj a JOIN products p ON p.id=a.product_id ORDER BY a.id DESC LIMIT 100`),
+  };
+});
+function stockItemFields(body) {
   const name = String(body.name || '').trim();
   if (!name) bad('请填写名称');
   const kind = ['原料', '包材', '成品'].includes(body.kind) ? body.kind : '原料';
   const unit = String(body.unit || '').trim() || '个';
-  const cost = isInt(body.cost_cents) && body.cost_cents >= 0 ? body.cost_cents : 0;
+  const cost = typeof body.cost_cents === 'number' && body.cost_cents >= 0 ? Math.round(body.cost_cents * 100) / 100 : 0;
   const low = typeof body.low_qty === 'number' && body.low_qty >= 0 ? body.low_qty : 0;
+  const packQty = typeof body.pack_qty === 'number' && body.pack_qty > 0 ? body.pack_qty : null;
+  const packUnit = packQty ? (String(body.pack_unit || '').trim() || '包') : null;
+  return { name, kind, unit, cost, low, packQty, packUnit };
+}
+route('POST', '/api/stock/items', KITCHEN, ({ user, body }) => {
+  const f = stockItemFields(body);
   if (body.id) {
-    run(`UPDATE stock_items SET name=?, kind=?, unit=?, cost_cents=?, low_qty=?, active=? WHERE id=?`, name, kind, unit, cost, low, body.active ? 1 : 0, body.id);
+    run(`UPDATE stock_items SET name=?, kind=?, unit=?, cost_cents=?, low_qty=?, active=?, pack_qty=?, pack_unit=? WHERE id=?`, f.name, f.kind, f.unit, f.cost, f.low, body.active ? 1 : 0, f.packQty, f.packUnit, body.id);
     return { id: body.id };
   }
-  const r = run(`INSERT INTO stock_items (name, kind, unit, cost_cents, low_qty, active) VALUES (?,?,?,?,?,1)`, name, kind, unit, cost, low);
-  log(user, '新增库存品', { name, kind, unit });
+  if (get(`SELECT 1 FROM stock_items WHERE name=?`, f.name)) bad('已经有同名的库存品了');
+  const r = run(`INSERT INTO stock_items (name, kind, unit, cost_cents, low_qty, active, pack_qty, pack_unit) VALUES (?,?,?,?,?,1,?,?)`, f.name, f.kind, f.unit, f.cost, f.low, f.packQty, f.packUnit);
+  log(user, '新增库存品', { name: f.name, kind: f.kind, unit: f.unit });
   return { id: Number(r.lastInsertRowid) };
+});
+// 批量导入库存品：同名的更新资料，新的新增；填了期初库存的记一笔入库
+route('POST', '/api/stock/import', KITCHEN, ({ user, body }) => {
+  const rows = Array.isArray(body.rows) ? body.rows : [];
+  if (!rows.length) bad('没有可导入的行');
+  if (rows.length > 1000) bad('一次最多导入 1000 行');
+  return tx(() => {
+    let added = 0; let updated = 0;
+    rows.forEach((r, i) => {
+      let f;
+      try { f = stockItemFields(r); } catch (e) { bad(`第 ${i + 1} 行：${e.message}`); }
+      const old = get(`SELECT id FROM stock_items WHERE name=?`, f.name);
+      let id;
+      if (old) {
+        run(`UPDATE stock_items SET kind=?, unit=?, cost_cents=?, low_qty=?, pack_qty=?, pack_unit=?, active=1 WHERE id=?`, f.kind, f.unit, f.cost, f.low, f.packQty, f.packUnit, old.id);
+        id = old.id; updated++;
+      } else {
+        id = Number(run(`INSERT INTO stock_items (name, kind, unit, cost_cents, low_qty, active, pack_qty, pack_unit) VALUES (?,?,?,?,?,1,?,?)`, f.name, f.kind, f.unit, f.cost, f.low, f.packQty, f.packUnit).lastInsertRowid);
+        added++;
+      }
+      const q = Number(r.init_qty);
+      if (r.init_qty !== undefined && r.init_qty !== '' && Number.isFinite(q) && q > 0) {
+        run(`INSERT INTO stock_moves (item_id, created_at, type, qty, cost_cents, note, operator_name) VALUES (?,?,'in',?,NULL,'批量导入期初库存',?)`, id, now(), q, user.name);
+      }
+    });
+    log(user, '批量导入库存品', { added, updated });
+    return { added, updated };
+  });
 });
 route('POST', '/api/stock/moves', KITCHEN, ({ user, body }) => {
   const item = get(`SELECT s.*, ${stockQty} AS qty FROM stock_items s WHERE s.id=?`, body.item_id);
   if (!item) bad('库存品不存在');
-  const q = Number(body.qty);
+  let q = Number(body.qty);
   if (!Number.isFinite(q) || q < 0 || (q === 0 && body.type !== 'count')) bad('数量不对');
+  // 按包装登记（例如 1 袋），换算成主单位（25 kg）
+  if (body.by_pack) {
+    if (!item.pack_qty) bad('这个库存品没有设置规格');
+    q = Math.round(q * item.pack_qty * 1000) / 1000;
+  }
   let delta;
   if (body.type === 'in') delta = q;
   else if (body.type === 'use' || body.type === 'loss') delta = -q;
   else if (body.type === 'count') delta = Math.round((q - item.qty) * 1000) / 1000;
   else bad('类型不对');
+  const cost = typeof body.cost_cents === 'number' && body.cost_cents > 0 ? body.cost_cents : null;
   run(`INSERT INTO stock_moves (item_id, created_at, type, qty, cost_cents, note, operator_name) VALUES (?,?,?,?,?,?,?)`,
-    item.id, now(), body.type, delta, isInt(body.cost_cents) ? body.cost_cents : null, String(body.note || ''), user.name);
-  if (body.type === 'in' && isInt(body.cost_cents) && body.cost_cents > 0 && q > 0) {
-    run(`UPDATE stock_items SET cost_cents=? WHERE id=?`, Math.round(body.cost_cents / q), item.id);
-  }
+    item.id, now(), body.type, delta, cost, String(body.note || ''), user.name);
+  // 入库填了这批总金额，就更新单价（元/主单位）
+  if (body.type === 'in' && cost && q > 0) run(`UPDATE stock_items SET cost_cents=? WHERE id=?`, Math.round(cost / q * 100) / 100, item.id);
   if (body.type === 'count') log(user, '盘点', { item: item.name, system: item.qty, actual: q, diff: delta });
-  return { ok: true, delta };
+  return { ok: true, delta, qty_main: q };
 });
-
-// 盘点：按理论库存列出，一次填好所有实盘数
+// 盘点：按理论库存列出，一次填好所有实盘数（库存品和成品）
 route('POST', '/api/stock/count', KITCHEN, ({ user, body }) => {
-  const rows = (Array.isArray(body.rows) ? body.rows : []).filter((r) => r && r.qty !== null && r.qty !== undefined && r.qty !== '');
-  if (!rows.length) bad('还没有填实盘数');
+  const filled = (r) => r && r.qty !== null && r.qty !== undefined && r.qty !== '';
+  const rows = (Array.isArray(body.rows) ? body.rows : []).filter(filled);
+  const prows = (Array.isArray(body.products) ? body.products : []).filter(filled);
+  if (!rows.length && !prows.length) bad('还没有填实盘数');
   const note = String(body.note || '').trim();
   return tx(() => {
     const out = [];
@@ -825,9 +897,117 @@ route('POST', '/api/stock/count', KITCHEN, ({ user, body }) => {
         item.id, now(), delta, note || '盘点', user.name);
       out.push({ name: item.name, system: item.qty, actual: q, diff: delta });
     }
+    const fs_ = finishedStock();
+    for (const r of prows) {
+      const p = get(`SELECT * FROM products WHERE id=?`, r.product_id);
+      if (!p) bad('商品不存在');
+      const q = Number(r.qty);
+      if (!isInt(q) || q < 0) bad(`${p.name} 的实盘数要填整数`);
+      const delta = q - (fs_[p.id] ?? 0);
+      run(`INSERT INTO product_adj (product_id, created_at, qty, note, operator_name) VALUES (?,?,?,?,?)`, p.id, now(), delta, note || '盘点', user.name);
+      out.push({ name: p.name, system: fs_[p.id] ?? 0, actual: q, diff: delta });
+    }
     log(user, '盘点', { n: out.length, diffs: out.filter((x) => x.diff).map((x) => `${x.name}${x.diff > 0 ? '+' : ''}${x.diff}`).join(' ') });
     return { ok: true, rows: out };
   });
+});
+
+// 产品配方（BOM）
+route('GET', '/api/bom', KITCHEN, () => {
+  const rows = all(`SELECT b.*, s.name, s.unit, s.kind, s.cost_cents FROM bom b JOIN stock_items s ON s.id=b.item_id ORDER BY s.kind, s.name`);
+  const by = {};
+  for (const r of rows) (by[r.product_id] = by[r.product_id] || []).push(r);
+  return { bom: by, unit_costs: unitCosts() };
+});
+route('POST', '/api/bom', OWNER, ({ user, body }) => {
+  const p = get(`SELECT * FROM products WHERE id=?`, body.product_id);
+  if (!p) bad('商品不存在');
+  const rows = (Array.isArray(body.rows) ? body.rows : []).filter((r) => r && r.item_id);
+  const seen = new Set();
+  for (const r of rows) {
+    if (!get(`SELECT 1 FROM stock_items WHERE id=?`, r.item_id)) bad('库存品不存在');
+    if (seen.has(r.item_id)) bad('同一种原料只能填一行');
+    seen.add(r.item_id);
+    if (typeof r.qty !== 'number' || !(r.qty > 0)) bad('用量要大于 0');
+  }
+  tx(() => {
+    run(`DELETE FROM bom WHERE product_id=?`, p.id);
+    for (const r of rows) run(`INSERT INTO bom (product_id, item_id, qty) VALUES (?,?,?)`, p.id, r.item_id, r.qty);
+  });
+  log(user, '修改配方', { product: p.name, n: rows.length });
+  return { ok: true, unit_cost: unitCosts()[p.id] ?? 0 };
+});
+
+// 原材料订购计划：未来几天的生产计划（没保存的用系统建议数）× 配方，和现有库存比
+route('GET', '/api/purchase-plan', KITCHEN, ({ query }) => {
+  const from = isDate(query.from) ? query.from : addDays(today(), 1);
+  const days = Math.min(Math.max(parseInt(query.days, 10) || 3, 1), 14);
+  const need = {}; const dayInfo = [];
+  const boms = all(`SELECT * FROM bom`);
+  for (let i = 0; i < days; i++) {
+    const d = addDays(from, i);
+    const saved = all(`SELECT product_id, qty FROM plans WHERE date=?`, d);
+    let src = 'saved'; let rows = saved;
+    if (!saved.length) { src = 'forecast'; rows = forecast(d).map((x) => ({ product_id: x.product_id, qty: x.suggest })); }
+    dayInfo.push({ date: d, source: src, total: rows.reduce((a, r) => a + r.qty, 0) });
+    for (const r of rows) for (const b of boms.filter((x) => x.product_id === r.product_id)) need[b.item_id] = (need[b.item_id] || 0) + b.qty * r.qty;
+  }
+  const items = all(`SELECT s.*, ${stockQty} AS qty FROM stock_items s WHERE s.active=1 ORDER BY s.kind, s.name`).filter((s) => need[s.id]).map((s) => {
+    const n = Math.round(need[s.id] * 1000) / 1000;
+    const short = Math.max(0, Math.round((n + (s.low_qty || 0) - s.qty) * 1000) / 1000);
+    const packs = short && s.pack_qty ? Math.ceil(short / s.pack_qty) : null;
+    const buyQty = packs ? packs * s.pack_qty : short;
+    return { id: s.id, name: s.name, kind: s.kind, unit: s.unit, pack_qty: s.pack_qty, pack_unit: s.pack_unit, need: n, stock: Math.round(s.qty * 1000) / 1000, low_qty: s.low_qty, short, packs, buy_qty: buyQty, cost_cents: Math.round(buyQty * s.cost_cents) };
+  });
+  const noBom = all(`SELECT name FROM products WHERE active=1 AND id NOT IN (SELECT product_id FROM bom)`).map((r) => r.name);
+  return { from, days, day_info: dayInfo, items, no_bom: noBom };
+});
+
+// 利润：营业收入 − 出炉用掉的原料成本 − 原料损耗（成本按库存品现在的单价算）
+function profitSummary(from, to) {
+  const W = `o.status='done' AND substr(o.created_at,1,10) BETWEEN ? AND ?`;
+  const revenue = get(`SELECT COALESCE(SUM(p.amount_cents),0) AS v FROM payments p JOIN orders o ON o.id=p.order_id WHERE ${W}`, from, to).v;
+  const moveCost = (type) => -get(`SELECT COALESCE(SUM(m.qty * s.cost_cents),0) AS v FROM stock_moves m JOIN stock_items s ON s.id=m.item_id WHERE m.type=? AND substr(m.created_at,1,10) BETWEEN ? AND ?`, type, from, to).v;
+  const material = Math.round(moveCost('bom'));
+  const rawLoss = Math.round(moveCost('loss'));
+  const countLoss = Math.round(-get(`SELECT COALESCE(SUM(m.qty * s.cost_cents),0) AS v FROM stock_moves m JOIN stock_items s ON s.id=m.item_id WHERE m.type='count' AND m.qty < 0 AND substr(m.created_at,1,10) BETWEEN ? AND ?`, from, to).v);
+  const uc = unitCosts();
+  const lossLogs = all(`SELECT product_id, SUM(qty) AS q FROM production_logs WHERE type='loss' AND date BETWEEN ? AND ? GROUP BY product_id`, from, to);
+  const productLoss = Math.round(lossLogs.reduce((a, r) => a + r.q * (uc[r.product_id] || 0), 0));
+  // 按商品：售出数量、打折后的销售额（整单折扣按金额分摊）、配方成本、毛利
+  const items = all(`SELECT i.product_id, i.name, i.qty, i.price_cents, o.total_cents, COALESCE(o.subtotal_cents, o.total_cents) AS sub, p.category
+    FROM order_items i JOIN orders o ON o.id=i.order_id LEFT JOIN products p ON p.id=i.product_id WHERE ${W}`, from, to);
+  const prods = new Map();
+  for (const it of items) {
+    const key = it.product_id ? `p${it.product_id}` : `n${it.name}`;
+    if (!prods.has(key)) prods.set(key, { name: it.name, category: it.product_id ? (it.category || '其他') : '临时商品', qty: 0, sales: 0, unit_cost: it.product_id ? uc[it.product_id] ?? null : null });
+    const r = prods.get(key);
+    r.qty += it.qty;
+    r.sales += it.sub ? it.qty * it.price_cents * it.total_cents / it.sub : 0;
+  }
+  const products = [...prods.values()].map((r) => {
+    const cost = r.unit_cost === null ? null : Math.round(r.unit_cost * r.qty);
+    const sales = Math.round(r.sales);
+    return { ...r, sales, cost, gross: cost === null ? null : sales - cost };
+  }).sort((x, y) => y.sales - x.sales);
+  const cats = {};
+  for (const r of products) {
+    const c = cats[r.category] = cats[r.category] || { category: r.category, qty: 0, sales: 0, cost: 0, gross: 0, no_cost: 0 };
+    c.qty += r.qty; c.sales += r.sales;
+    if (r.cost === null) c.no_cost += r.sales; else { c.cost += r.cost; c.gross += r.gross; }
+  }
+  const overpay = get(`SELECT COALESCE(SUM(overpay_cents),0) AS v FROM orders o WHERE ${W}`, from, to).v;
+  return {
+    from, to, revenue, material, raw_loss: rawLoss, product_loss: productLoss, count_loss: countLoss, overpay,
+    profit: revenue - material - rawLoss,
+    categories: Object.values(cats).sort((x, y) => y.sales - x.sales), products,
+    no_bom: all(`SELECT name FROM products WHERE active=1 AND id NOT IN (SELECT product_id FROM bom)`).map((r) => r.name),
+  };
+}
+route('GET', '/api/profit', OWNER, ({ query }) => {
+  const to = isDate(query.to) ? query.to : today();
+  const from = isDate(query.from) ? query.from : to;
+  return { today: profitSummary(today(), today()), range: profitSummary(from, to) };
 });
 
 // 生产计划：预测某天每种商品该做多少（初版算法）
@@ -985,9 +1165,10 @@ function dayCloseReceipt(date) {
     L.push({ l: '实点现金', r: money(sv.cash_actual_cents) }, { l: '  现金差额', r: money(sv.cash_actual_cents - sv.cash_system_cents) });
     L.push({ l: '收银机小票', r: money(sv.pos_actual_cents) }, { l: '  收银机差额', r: money(sv.pos_actual_cents - sv.pos_system_cents) });
     let tk = null; try { tk = JSON.parse(sv.tickets_json || 'null'); } catch { /* 旧数据 */ }
-    if (tk) {
-      L.push({ t: '店内余票（实点/应有）' });
-      for (const r of tk.rows) if (r.actual !== null || r.system) L.push({ l: `  ${faceText(r.face_cents)}元票`, r: `${r.actual ?? '-'}/${r.system}张` });
+    if (tk && tk.system_cents !== undefined) {
+      L.push({ t: '店内余票' });
+      for (const r of tk.rows) L.push({ l: `  ${faceText(r.face_cents)}元票`, r: `${r.count}张` });
+      L.push({ l: '  实点 / 应有', r: `${money(tk.actual_cents)} / ${money(tk.system_cents)}` });
     }
     if (sv.note) L.push({ t: `备注：${sv.note}` });
     L.push({ l: '日结人', r: sv.closed_by || '' }, { l: '日结时间', r: (sv.closed_at || '').slice(0, 16) });
