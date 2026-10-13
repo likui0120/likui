@@ -1,0 +1,5 @@
+data/
+app/data/
+app/node/
+dist/
+*.zip

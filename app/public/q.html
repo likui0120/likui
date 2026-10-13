@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>存票查询</title>
+<link rel="stylesheet" href="/style.css">
+<style>
+  .wrap{max-width:440px;margin:0 auto;padding:24px 16px;display:grid;gap:16px}
+  .codein{font-family:var(--f-mono);font-size:34px;letter-spacing:.4em;text-align:center;padding:12px;min-height:64px}
+  .bal{text-align:center;display:grid;gap:4px;padding:16px 0}
+  .bal .v{font-family:var(--f-mono);font-size:40px;font-weight:700;color:var(--stored)}
+  .tx{display:flex;gap:10px;align-items:center;justify-content:space-between;border-bottom:1px solid var(--line);padding:10px 0}
+  .tx .l{display:flex;gap:10px;align-items:center;min-width:0}
+  .tx .d{font-size:14px;min-width:0}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h2 id="shop">存票查询</h2>
+  <form id="f" class="card">
+    <label class="f"><span>输入 5 位查询码</span><input id="code" class="codein" inputmode="numeric" maxlength="5" autocomplete="off" pattern="\d{5}"></label>
+    <button class="btn primary" type="submit">查询</button>
+    <p id="msg" class="warn" role="status"></p>
+  </form>
+  <div id="out"></div>
+  <p class="muted" style="font-size:13px">查询码只有你本人知道，请不要告诉别人。忘记了可以到柜台找店员。</p>
+</div>
+<script>
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const yuan = (c) => (Number(c || 0) / 100).toFixed(2);
+const TX = { deposit: '存入餐票', spend: '消费', refund: '撤单退回', adjust: '余额调整', close: '销户退还' };
+fetch('/api/public/info').then((r) => r.json()).then((d) => { if (d.shop_name) { document.getElementById('shop').textContent = d.shop_name + ' · 存票查询'; } }).catch(() => {});
+const code = document.getElementById('code');
+code.addEventListener('input', () => { code.value = code.value.replace(/\D/g, '').slice(0, 5); });
+document.getElementById('f').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const msg = document.getElementById('msg'); const out = document.getElementById('out');
+  msg.textContent = ''; out.innerHTML = '';
+  if (!/^\d{5}$/.test(code.value)) { msg.textContent = '请输入 5 位数字'; return; }
+  try {
+    const r = await fetch('/api/public/lookup', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code: code.value }) });
+    const d = await r.json();
+    if (!r.ok) { msg.textContent = d.error || '查询失败'; return; }
+    out.innerHTML = `<div class="card">
+      <div class="bal"><span class="muted">${esc(d.name)}${d.status === 'active' ? '' : '（已销户）'} · 当前余额</span><span class="v">¥${yuan(d.balance_cents)}</span></div>
+      <div>${d.txs.map((t) => `<div class="tx"><span class="l">${t.photo ? `<img class="thumb sm" src="/photos/${esc(t.photo)}" alt="消费照片">` : ''}<span class="d">${TX[t.type] || t.type}${t.items ? '：' + esc(t.items) : ''}<br><span class="muted" style="font-size:12px">${esc(t.created_at.slice(0, 16))}</span></span></span>
+        <b class="num ${t.amount_cents > 0 ? 'ok' : ''}">${t.amount_cents > 0 ? '+' : ''}${yuan(t.amount_cents)}</b></div>`).join('') || '<p class="muted">没有记录</p>'}</div></div>`;
+  } catch { msg.textContent = '网络不通，请确认已连上店里的 WiFi'; }
+});
+document.addEventListener('click', (e) => {
+  const t = e.target.closest('img.thumb'); if (!t) return;
+  const bg = document.createElement('div'); bg.className = 'modal-bg';
+  bg.innerHTML = `<img class="imgview" src="${t.src}" alt="消费照片">`;
+  bg.onclick = () => bg.remove(); document.body.appendChild(bg);
+});
+</script>
+</body>
+</html>
