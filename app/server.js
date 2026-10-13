@@ -33,6 +33,11 @@ function addColumn(table, col, decl) {
   if (!db.prepare(`PRAGMA table_info(${table})`).all().some((c) => c.name === col)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${decl}`);
 }
 addColumn('orders', 'overpay_cents', 'INTEGER NOT NULL DEFAULT 0');
+addColumn('orders', 'subtotal_cents', 'INTEGER'); // 打折前金额（旧数据为空，等于 total_cents）
+addColumn('orders', 'discount_pct', 'INTEGER'); // 90 表示 9 折
+addColumn('orders', 'discount_cents', 'INTEGER NOT NULL DEFAULT 0');
+addColumn('redemptions', 'kind', "TEXT NOT NULL DEFAULT 'school'"); // school 去学校兑换现金 / stall 拿去食堂其他档口用
+addColumn('day_closes', 'tickets_json', 'TEXT'); // 日结时清点的店内余票
 
 // ---------- 工具 ----------
 const now = () => {
@@ -98,6 +103,15 @@ if (!get(`SELECT id FROM users LIMIT 1`)) {
 // 第一版默认店名是"药大烘焙"，没改过的话换成正式店名
 run(`UPDATE settings SET value=? WHERE key='shop_name' AND value='药大烘焙'`, DEFAULT_SHOP);
 process.title = `${getSetting('shop_name', DEFAULT_SHOP)}收银系统`; // Windows 黑色窗口的标题
+
+// 打折：店主在设置里开启，预设 3 个折扣；"全部打折"打开后每一单都按这个折扣
+function discountCfg() {
+  const presets = getSetting('discount_presets', '90,85,80').split(',').map(Number);
+  const on = getSetting('discount_on', '0') === '1';
+  const allPct = Number(getSetting('discount_all', '')) || null;
+  return { on, presets, all: on ? allPct : null };
+}
+const zhe = (pct) => `${pct / 10}折`;
 
 // ---------- 照片 ----------
 function savePhoto(dataUrl) {
@@ -202,6 +216,7 @@ route('GET', '/api/me', ANY, ({ user, req }) => {
     shop_name: getSetting('shop_name', DEFAULT_SHOP), version: VERSION, query_url: queryUrl(req),
     ticket_faces: getSetting('ticket_faces', '500,1000,2000').split(',').map(Number).filter((n) => n > 0),
     print: { mode: pc.mode, auto: pc.auto, paper: pc.paper },
+    discount: discountCfg(),
   };
 });
 route('POST', '/api/me/pin', ANY, ({ user, body }) => {
@@ -250,6 +265,8 @@ const SETTING_CHECK = {
   print_cols: (v) => v === '' || (/^\d+$/.test(v) && Number(v) >= 16 && Number(v) <= 64) || '每行字数要在 16 到 64 之间',
   print_auto: (v) => ['off', 'all', 'stored'].includes(v) || '自动打印选项不对',
   print_footer: (v) => v.length <= 40 || '小票底部文字最多 40 个字',
+  discount_on: (v) => ['0', '1'].includes(v) || '打折开关不对',
+  discount_presets: (v) => (/^\d{1,2}(,\d{1,2}){2}$/.test(v) && v.split(',').every((x) => Number(x) >= 1 && Number(x) <= 99)) || '三个折扣要填 1 到 99 之间的数，例如 90,85,80',
 };
 route('POST', '/api/settings', OWNER, ({ user, body }) => {
   const changes = {};
@@ -266,7 +283,8 @@ route('POST', '/api/settings', OWNER, ({ user, body }) => {
 });
 
 // 商品
-route('GET', '/api/products', ANY, () => all(`SELECT * FROM products ORDER BY active DESC, sort, id`));
+route('GET', '/api/products', ANY, () => all(`SELECT p.*, COALESCE((SELECT SUM(i.qty) FROM order_items i JOIN orders o ON o.id=i.order_id
+  WHERE i.product_id=p.id AND o.status='done' AND substr(o.created_at,1,10) >= ?),0) AS sold_30d FROM products p ORDER BY active DESC, sort, id`, addDays(today(), -29)));
 route('POST', '/api/products', OWNER, ({ user, body }) => {
   const name = String(body.name || '').trim();
   if (!name) bad('请填写商品名');
@@ -299,7 +317,15 @@ route('POST', '/api/orders', STAFF, ({ user, body }) => {
     if (!name || !isInt(it.price_cents) || it.price_cents < 0) bad('临时商品需要名称和价格');
     return { product_id: null, name, qty: it.qty, price_cents: it.price_cents };
   });
-  const total = lines.reduce((s, l) => s + l.qty * l.price_cents, 0);
+  const subtotal = lines.reduce((s, l) => s + l.qty * l.price_cents, 0);
+  let pct = null;
+  if (body.discount_pct !== undefined && body.discount_pct !== null && body.discount_pct !== 100) {
+    if (!isInt(body.discount_pct) || body.discount_pct < 1 || body.discount_pct > 99) bad('折扣不对');
+    if (!discountCfg().on) bad('打折功能没有开启，请店主到"设置"里开启');
+    pct = body.discount_pct;
+  }
+  const discount = pct ? subtotal - Math.round(subtotal * pct / 100) : 0;
+  const total = subtotal - discount;
 
   const pays = Array.isArray(body.payments) ? body.payments : [];
   if (!pays.length && total > 0) bad('请选择收款方式');
@@ -338,8 +364,8 @@ route('POST', '/api/orders', STAFF, ({ user, body }) => {
       if (balanceOf(Number(id)) < amt) bad('存票余额不足');
     }
     const photo = savePhoto(body.photo);
-    const o = run(`INSERT INTO orders (created_at, cashier_id, cashier_name, total_cents, overpay_cents, status, photo, note) VALUES (?,?,?,?,?, 'done', ?, ?)`,
-      now(), user.id, user.name, total, over, photo, String(body.note || ''));
+    const o = run(`INSERT INTO orders (created_at, cashier_id, cashier_name, total_cents, overpay_cents, status, photo, note, subtotal_cents, discount_pct, discount_cents) VALUES (?,?,?,?,?, 'done', ?, ?, ?, ?, ?)`,
+      now(), user.id, user.name, total, over, photo, String(body.note || ''), subtotal, pct, discount);
     const oid = Number(o.lastInsertRowid);
     for (const l of lines) run(`INSERT INTO order_items (order_id, product_id, name, qty, price_cents) VALUES (?,?,?,?,?)`, oid, l.product_id, l.name, l.qty, l.price_cents);
     for (const p of norm) {
@@ -351,8 +377,21 @@ route('POST', '/api/orders', STAFF, ({ user, body }) => {
       }
       if (p.method === 'ticket') addTicketBatches(p.tickets, 'temp', 'order', oid, null);
     }
-    return { id: oid, total_cents: total, paid_cents: paid, overpay_cents: over, has_stored: norm.some((p) => p.method === 'stored') };
+    return { id: oid, total_cents: total, subtotal_cents: subtotal, discount_cents: discount, paid_cents: paid, overpay_cents: over, has_stored: norm.some((p) => p.method === 'stored') };
   });
+});
+
+route('POST', '/api/discount-all', STAFF, ({ user, body }) => {
+  if (body.pct === null || body.pct === undefined || body.pct === '') {
+    run(`DELETE FROM settings WHERE key='discount_all'`);
+    log(user, '关闭全部打折', '');
+    return discountCfg();
+  }
+  if (!discountCfg().on) bad('打折功能没有开启，请店主到"设置"里开启');
+  if (!isInt(body.pct) || body.pct < 1 || body.pct > 99) bad('折扣不对');
+  run(`INSERT INTO settings (key, value) VALUES ('discount_all',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, String(body.pct));
+  log(user, '开启全部打折', zhe(body.pct));
+  return discountCfg();
 });
 
 function ordersDetail(rows) {
@@ -517,8 +556,46 @@ route('GET', '/api/tickets', OWNER, () => {
   const groups = all(`SELECT face_cents, expire_date, SUM(count) AS count FROM ticket_batches WHERE redemption_id IS NULL GROUP BY face_cents, expire_date ORDER BY COALESCE(expire_date,'9999'), face_cents`);
   const pendingTotal = pending.reduce((s, b) => s + b.face_cents * b.count, 0);
   const liability = get(`SELECT COALESCE(SUM(t.amount_cents),0) AS v FROM account_tx t JOIN accounts a ON a.id=t.account_id WHERE a.status='active'`).v;
-  const redemptions = all(`SELECT * FROM redemptions ORDER BY id DESC LIMIT 100`);
-  return { pending, groups, pending_total_cents: pendingTotal, liability_cents: liability, redemptions, today: today() };
+  const redemptions = all(`SELECT * FROM redemptions ORDER BY id DESC LIMIT 200`);
+  const kinds = Object.fromEntries(all(`SELECT kind, COALESCE(SUM(face_total_cents),0) AS v FROM redemptions WHERE substr(created_at,1,7)=? GROUP BY kind`, today().slice(0, 7)).map((r) => [r.kind, r.v]));
+  return { pending, groups, by_face: ticketsOnHand(), pending_total_cents: pendingTotal, liability_cents: liability, redemptions, month: { school: kinds.school || 0, stall: kinds.stall || 0 }, today: today() };
+});
+// 店里手上还有的纸质餐票（没去兑换、也没拿去其他档口用的），按面额
+function ticketsOnHand() {
+  return all(`SELECT face_cents, SUM(count) AS count FROM ticket_batches WHERE redemption_id IS NULL GROUP BY face_cents ORDER BY face_cents`);
+}
+// 拿店里收到的餐票去食堂其他档口用：按面额和张数，从最早到期的票开始扣
+route('POST', '/api/ticket-use', OWNER, ({ user, body }) => {
+  const want = Array.isArray(body.tickets) ? body.tickets.filter((k) => k && k.count) : [];
+  const face = ticketsTotal(want);
+  if (!face) bad('请选择要用的餐票');
+  const note = String(body.note || '').trim();
+  if (!note) bad('请填写用在哪个档口、买了什么');
+  return tx(() => {
+    const r = run(`INSERT INTO redemptions (created_at, face_total_cents, received_cents, note, operator_name, kind) VALUES (?,?,?,?,?, 'stall')`,
+      now(), face, face, note, user.name);
+    const rid = Number(r.lastInsertRowid);
+    for (const k of want) {
+      let need = k.count;
+      const batches = all(`SELECT * FROM ticket_batches WHERE redemption_id IS NULL AND face_cents=? ORDER BY COALESCE(expire_date,'9999'), id`, k.face_cents);
+      if (batches.reduce((s2, b) => s2 + b.count, 0) < need) bad(`店里的 ${(k.face_cents / 100)} 元票不够 ${k.count} 张`);
+      for (const b of batches) {
+        if (!need) break;
+        if (b.count <= need) {
+          run(`UPDATE ticket_batches SET redemption_id=? WHERE id=?`, rid, b.id);
+          need -= b.count;
+        } else {
+          // 一批票只用掉一部分：拆成两批
+          run(`UPDATE ticket_batches SET count=? WHERE id=?`, b.count - need, b.id);
+          run(`INSERT INTO ticket_batches (created_at, face_cents, count, expire_date, source, ref_type, ref_id, redemption_id) VALUES (?,?,?,?,?,?,?,?)`,
+            b.created_at, b.face_cents, need, b.expire_date, b.source, b.ref_type, b.ref_id, rid);
+          need = 0;
+        }
+      }
+    }
+    log(user, '餐票档口使用', { id: rid, face_total_cents: face, note });
+    return { id: rid, face_total_cents: face };
+  });
 });
 route('POST', '/api/redemptions', OWNER, ({ user, body }) => {
   const ids = Array.isArray(body.batch_ids) ? body.batch_ids.filter(isInt) : [];
@@ -545,15 +622,22 @@ function daySystem(date) {
   const m = { cash: 0, pos: 0, ticket: 0, stored: 0 };
   const n = { cash: 0, pos: 0, ticket: 0, stored: 0 };
   for (const r of by) { m[r.method] = r.amount; n[r.method] = r.orders; }
-  const o = get(`SELECT COUNT(*) AS n, COALESCE(SUM(total_cents),0) AS total, COALESCE(SUM(overpay_cents),0) AS over FROM orders WHERE status='done' AND substr(created_at,1,10)=?`, date);
+  const o = get(`SELECT COUNT(*) AS n, COALESCE(SUM(total_cents),0) AS total, COALESCE(SUM(overpay_cents),0) AS over, COALESCE(SUM(discount_cents),0) AS disc FROM orders WHERE status='done' AND substr(created_at,1,10)=?`, date);
   const voided = get(`SELECT COUNT(*) AS n FROM orders WHERE status='void' AND substr(created_at,1,10)=?`, date).n;
   const deposits = get(`SELECT COALESCE(SUM(amount_cents),0) AS v FROM account_tx WHERE type='deposit' AND substr(created_at,1,10)=?`, date).v;
   const paid = m.cash + m.pos + m.ticket + m.stored;
-  return { amounts: m, orders_by_method: n, orders: o.n, total_cents: o.total, overpay_cents: o.over, paid_cents: paid, voided, deposits_cents: deposits };
+  return { amounts: m, orders_by_method: n, orders: o.n, total_cents: o.total, overpay_cents: o.over, discount_cents: o.disc, paid_cents: paid, voided, deposits_cents: deposits };
+}
+function ticketFaces() {
+  const set = getSetting('ticket_faces', '500,1000,2000').split(',').map(Number).filter((n) => n > 0);
+  return [...new Set([...set, ...ticketsOnHand().map((r) => r.face_cents)])].sort((a, b) => a - b);
 }
 route('GET', '/api/dayclose', STAFF, ({ query }) => {
   const date = isDate(query.date) ? query.date : today();
-  return { date, system: daySystem(date), saved: get(`SELECT * FROM day_closes WHERE date=?`, date) || null };
+  const saved = get(`SELECT * FROM day_closes WHERE date=?`, date) || null;
+  if (saved) { try { saved.tickets = JSON.parse(saved.tickets_json || 'null'); } catch { saved.tickets = null; } }
+  const onHand = Object.fromEntries(ticketsOnHand().map((r) => [r.face_cents, r.count]));
+  return { date, today: today(), system: daySystem(date), saved, tickets_now: ticketFaces().map((f) => ({ face_cents: f, count: onHand[f] || 0 })) };
 });
 route('POST', '/api/dayclose', STAFF, ({ user, body }) => {
   const date = isDate(body.date) ? body.date : today();
@@ -562,13 +646,29 @@ route('POST', '/api/dayclose', STAFF, ({ user, body }) => {
   const cashDiff = body.cash_actual_cents - s.amounts.cash;
   const posDiff = body.pos_actual_cents - s.amounts.pos;
   const note = String(body.note || '').trim();
-  if ((cashDiff || posDiff) && !note) bad('有差额，请填写原因');
-  run(`INSERT INTO day_closes (date, cash_system_cents, cash_actual_cents, pos_system_cents, pos_actual_cents, ticket_cents, stored_cents, note, closed_by, closed_at)
-    VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(date) DO UPDATE SET cash_system_cents=excluded.cash_system_cents, cash_actual_cents=excluded.cash_actual_cents,
+  // 店内余票：系统应有张数（按现在的餐票库）和实点张数
+  let tickets = null; let ticketDiff = 0;
+  if (Array.isArray(body.tickets_actual) && body.tickets_actual.some((k) => k && k.count !== null && k.count !== undefined)) {
+    const onHand = Object.fromEntries(ticketsOnHand().map((r) => [r.face_cents, r.count]));
+    const rows = ticketFaces().map((f) => {
+      const k = body.tickets_actual.find((x) => x && x.face_cents === f);
+      const actual = k && k.count !== null && k.count !== undefined ? k.count : null;
+      if (actual !== null && (!isInt(actual) || actual < 0)) bad('余票张数不对');
+      return { face_cents: f, system: onHand[f] || 0, actual };
+    });
+    for (const r of rows) if (r.actual !== null) ticketDiff += Math.abs(r.actual - r.system);
+    tickets = { rows, at: now() };
+  } else {
+    const old = get(`SELECT tickets_json FROM day_closes WHERE date=?`, date);
+    if (old && old.tickets_json) tickets = JSON.parse(old.tickets_json);
+  }
+  if ((cashDiff || posDiff || ticketDiff) && !note) bad('有差额，请填写原因');
+  run(`INSERT INTO day_closes (date, cash_system_cents, cash_actual_cents, pos_system_cents, pos_actual_cents, ticket_cents, stored_cents, note, closed_by, closed_at, tickets_json)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(date) DO UPDATE SET cash_system_cents=excluded.cash_system_cents, cash_actual_cents=excluded.cash_actual_cents,
     pos_system_cents=excluded.pos_system_cents, pos_actual_cents=excluded.pos_actual_cents, ticket_cents=excluded.ticket_cents, stored_cents=excluded.stored_cents,
-    note=excluded.note, closed_by=excluded.closed_by, closed_at=excluded.closed_at`,
-    date, s.amounts.cash, body.cash_actual_cents, s.amounts.pos, body.pos_actual_cents, s.amounts.ticket, s.amounts.stored, note, user.name, now());
-  log(user, '日结', { date, cashDiff, posDiff });
+    note=excluded.note, closed_by=excluded.closed_by, closed_at=excluded.closed_at, tickets_json=excluded.tickets_json`,
+    date, s.amounts.cash, body.cash_actual_cents, s.amounts.pos, body.pos_actual_cents, s.amounts.ticket, s.amounts.stored, note, user.name, now(), tickets ? JSON.stringify(tickets) : null);
+  log(user, '日结', { date, cashDiff, posDiff, ticketDiff });
   return { ok: true };
 });
 
@@ -581,7 +681,7 @@ route('GET', '/api/reports', OWNER, ({ query }) => {
   const products = all(`SELECT i.name, SUM(i.qty) AS qty, SUM(i.qty*i.price_cents) AS amount FROM order_items i JOIN orders o ON o.id=i.order_id WHERE ${W} GROUP BY i.name ORDER BY amount DESC`, from, to);
   const days = all(`SELECT substr(o.created_at,1,10) AS day, p.method, SUM(p.amount_cents) AS amount FROM payments p JOIN orders o ON o.id=p.order_id WHERE ${W} GROUP BY day, p.method ORDER BY day`, from, to);
   const hours = all(`SELECT substr(o.created_at,12,2) AS hour, COUNT(*) AS orders, SUM(o.total_cents) AS amount FROM orders o WHERE ${W} GROUP BY hour ORDER BY hour`, from, to);
-  const totals = get(`SELECT COUNT(*) AS orders, COALESCE(SUM(total_cents),0) AS amount, COALESCE(SUM(overpay_cents),0) AS overpay FROM orders o WHERE ${W}`, from, to);
+  const totals = get(`SELECT COUNT(*) AS orders, COALESCE(SUM(total_cents),0) AS amount, COALESCE(SUM(overpay_cents),0) AS overpay, COALESCE(SUM(discount_cents),0) AS discount FROM orders o WHERE ${W}`, from, to);
   const produced = all(`SELECT p.name, SUM(CASE WHEN l.type='output' THEN l.qty ELSE 0 END) AS output, SUM(CASE WHEN l.type='loss' THEN l.qty ELSE 0 END) AS loss
     FROM production_logs l JOIN products p ON p.id=l.product_id WHERE l.date BETWEEN ? AND ? GROUP BY p.name`, from, to);
   return { from, to, methods, products, days, hours, totals, produced };
@@ -604,7 +704,8 @@ route('GET', '/api/export', OWNER, ({ query, res }) => {
   } else if (query.type === 'orders') {
     const rows = ordersDetail(all(`SELECT * FROM orders WHERE substr(created_at,1,10) BETWEEN ? AND ? ORDER BY id`, from, to));
     body = csv(rows, [['id', '订单号'], ['created_at', '时间'], [(r) => (r.status === 'void' ? '已撤销' : '正常'), '状态'], ['cashier_name', '收银员'],
-      [(r) => r.items.map((i) => `${i.name}×${i.qty}`).join(' '), '商品'], [(r) => yuan(r.total_cents), '商品金额'],
+      [(r) => r.items.map((i) => `${i.name}×${i.qty}`).join(' '), '商品'], [(r) => yuan(r.subtotal_cents ?? r.total_cents), '原价'],
+      [(r) => (r.discount_pct ? `${r.discount_pct / 10}折` : ''), '折扣'], [(r) => yuan(r.discount_cents || 0), '优惠'], [(r) => yuan(r.total_cents), '应收'],
       [(r) => yuan(r.payments.reduce((s, p) => s + p.amount_cents, 0)), '实收'], [(r) => yuan(r.overpay_cents || 0), '餐票溢收'],
       [(r) => r.payments.map((p) => `${METHOD[p.method]}${yuan(p.amount_cents)}`).join(' '), '收款方式']]);
     name = `订单汇总_${from}_${to}.csv`;
@@ -626,7 +727,8 @@ route('GET', '/api/export', OWNER, ({ query, res }) => {
 route('GET', '/api/production', KITCHEN, ({ query }) => {
   const date = isDate(query.date) ? query.date : today();
   const logs = all(`SELECT l.*, p.name FROM production_logs l JOIN products p ON p.id=l.product_id WHERE l.date=? ORDER BY l.id DESC`, date);
-  const plan = all(`SELECT pl.product_id, pl.qty, p.name FROM plans pl JOIN products p ON p.id=pl.product_id WHERE pl.date=?`, date);
+  // 计划表是前一天在"生产计划"页做好、保存到这一天的
+  const plan = all(`SELECT pl.product_id, pl.qty, p.name, p.category FROM plans pl JOIN products p ON p.id=pl.product_id WHERE pl.date=? ORDER BY p.sort, p.id`, date);
   return { date, logs, plan };
 });
 route('POST', '/api/production', KITCHEN, ({ user, body }) => {
@@ -637,6 +739,25 @@ route('POST', '/api/production', KITCHEN, ({ user, body }) => {
   const r = run(`INSERT INTO production_logs (date, created_at, product_id, type, qty, note, operator_name) VALUES (?,?,?,?,?,?,?)`,
     date, now(), body.product_id, body.type, body.qty, String(body.note || ''), user.name);
   return { id: Number(r.lastInsertRowid) };
+});
+// 后厨登记新品：同时加到商品里（设置页能看到、收银能卖）
+route('POST', '/api/production/new-product', KITCHEN, ({ user, body }) => {
+  const name = String(body.name || '').trim();
+  if (!name) bad('请填写新品名称');
+  if (!isInt(body.price_cents) || body.price_cents <= 0) bad('请填写新品售价');
+  if (get(`SELECT 1 FROM products WHERE name=?`, name)) bad('已经有这个商品了，请直接在商品里选');
+  if (!['output', 'loss', 'leftover'].includes(body.type)) bad('类型不对');
+  if (!isInt(body.qty) || body.qty <= 0) bad('数量不对');
+  const date = isDate(body.date) ? body.date : today();
+  const cat = String(body.category || '').trim() || '新品';
+  return tx(() => {
+    const sort = get(`SELECT COALESCE(MAX(sort),0)+1 AS s FROM products`).s;
+    const pid = Number(run(`INSERT INTO products (name, category, price_cents, active, sort) VALUES (?,?,?,1,?)`, name, cat, body.price_cents, sort).lastInsertRowid);
+    run(`INSERT INTO production_logs (date, created_at, product_id, type, qty, note, operator_name) VALUES (?,?,?,?,?,?,?)`,
+      date, now(), pid, body.type, body.qty, String(body.note || ''), user.name);
+    log(user, '后厨新增商品', { name, category: cat, price_cents: body.price_cents });
+    return { product_id: pid };
+  });
 });
 route('POST', '/api/production/:id/delete', KITCHEN, ({ user, params }) => {
   const l = get(`SELECT * FROM production_logs WHERE id=?`, Number(params.id));
@@ -685,6 +806,28 @@ route('POST', '/api/stock/moves', KITCHEN, ({ user, body }) => {
   }
   if (body.type === 'count') log(user, '盘点', { item: item.name, system: item.qty, actual: q, diff: delta });
   return { ok: true, delta };
+});
+
+// 盘点：按理论库存列出，一次填好所有实盘数
+route('POST', '/api/stock/count', KITCHEN, ({ user, body }) => {
+  const rows = (Array.isArray(body.rows) ? body.rows : []).filter((r) => r && r.qty !== null && r.qty !== undefined && r.qty !== '');
+  if (!rows.length) bad('还没有填实盘数');
+  const note = String(body.note || '').trim();
+  return tx(() => {
+    const out = [];
+    for (const r of rows) {
+      const item = get(`SELECT s.*, ${stockQty} AS qty FROM stock_items s WHERE s.id=?`, r.item_id);
+      if (!item) bad('库存品不存在');
+      const q = Number(r.qty);
+      if (!Number.isFinite(q) || q < 0) bad(`${item.name} 的实盘数不对`);
+      const delta = Math.round((q - item.qty) * 1000) / 1000;
+      run(`INSERT INTO stock_moves (item_id, created_at, type, qty, cost_cents, note, operator_name) VALUES (?,?,'count',?,NULL,?,?)`,
+        item.id, now(), delta, note || '盘点', user.name);
+      out.push({ name: item.name, system: item.qty, actual: q, diff: delta });
+    }
+    log(user, '盘点', { n: out.length, diffs: out.filter((x) => x.diff).map((x) => `${x.name}${x.diff > 0 ? '+' : ''}${x.diff}`).join(' ') });
+    return { ok: true, rows: out };
+  });
 });
 
 // 生产计划：预测某天每种商品该做多少（初版算法）
@@ -784,7 +927,9 @@ function orderReceipt(id) {
   L.push({ l: `单号：${o.id}`, r: `收银：${o.cashier_name || ''}` }, { l: `时间：${o.created_at.slice(0, 16)}` }, { hr: true });
   L.push({ l: '商品', r: qtyAmt('数量', '金额') });
   for (const i of items) L.push({ l: i.name, r: qtyAmt('×' + i.qty, money(i.qty * i.price_cents)) });
-  L.push({ hr: true }, { l: '合计', r: '￥' + money(o.total_cents), b: true });
+  L.push({ hr: true });
+  if (o.discount_cents > 0) L.push({ l: '小计', r: money(o.subtotal_cents) }, { l: `折扣（${zhe(o.discount_pct)}）`, r: '-' + money(o.discount_cents) });
+  L.push({ l: '合计', r: '￥' + money(o.total_cents), b: true });
   for (const p of pays) {
     if (p.method === 'ticket') {
       let t = [];
@@ -832,12 +977,18 @@ function dayCloseReceipt(date) {
   const L = receiptHead(`日结单 ${date}`);
   for (const k of ['cash', 'pos', 'ticket', 'stored']) L.push({ l: `${METHOD[k]}（${s.orders_by_method[k]}单）`, r: money(s.amounts[k]) });
   if (s.overpay_cents) L.push({ l: '  其中餐票溢收', r: money(s.overpay_cents) });
+  if (s.discount_cents) L.push({ l: '打折优惠', r: money(s.discount_cents) });
   L.push({ l: '四种来源合计', r: money(s.paid_cents), b: true }, { l: `商品金额（${s.orders}单）`, r: money(s.total_cents) });
   if (s.voided) L.push({ l: '撤销', r: `${s.voided}单` });
   L.push({ l: '当天存票存入', r: money(s.deposits_cents) }, { hr: true });
   if (sv) {
     L.push({ l: '实点现金', r: money(sv.cash_actual_cents) }, { l: '  现金差额', r: money(sv.cash_actual_cents - sv.cash_system_cents) });
     L.push({ l: '收银机小票', r: money(sv.pos_actual_cents) }, { l: '  收银机差额', r: money(sv.pos_actual_cents - sv.pos_system_cents) });
+    let tk = null; try { tk = JSON.parse(sv.tickets_json || 'null'); } catch { /* 旧数据 */ }
+    if (tk) {
+      L.push({ t: '店内余票（实点/应有）' });
+      for (const r of tk.rows) if (r.actual !== null || r.system) L.push({ l: `  ${faceText(r.face_cents)}元票`, r: `${r.actual ?? '-'}/${r.system}张` });
+    }
     if (sv.note) L.push({ t: `备注：${sv.note}` });
     L.push({ l: '日结人', r: sv.closed_by || '' }, { l: '日结时间', r: (sv.closed_at || '').slice(0, 16) });
   } else {

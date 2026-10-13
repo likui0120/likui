@@ -66,7 +66,8 @@ function compressImage(file) {
   });
 }
 
-const state = { me: null, view: null, products: [], cart: [], cat: '全部', photo: null, lastOrder: null };
+const state = { me: null, view: null, products: [], cart: [], cat: '全部', photo: null, lastOrder: null, discount: undefined };
+const zhe = (pct) => `${pct / 10}折`;
 
 // ---------- 小票打印 ----------
 const canPrint = () => state.me && state.me.print.mode !== 'none';
@@ -112,6 +113,66 @@ async function printReceipt(type, params = {}) {
   });
 }
 
+// ---------- 表格导出、打印（所有查询页通用） ----------
+// 读表格内容：表头为空的列（操作按钮、勾选框）不导出；输入框取填写的值
+function tableData(table) {
+  const ths = $$('thead th', table);
+  const keep = ths.map((th) => th.textContent.trim() !== '');
+  const head = ths.map((th) => th.textContent.trim()).filter((_, i) => keep[i]);
+  const rows = $$('tbody tr', table).filter((tr) => !tr.querySelector('td.empty')).map((tr) => [...tr.children].map((td) => {
+    const inp = td.querySelector('input:not([type=checkbox]),select');
+    if (inp) return inp.tagName === 'SELECT' ? inp.options[inp.selectedIndex]?.text || '' : inp.value;
+    const c = td.cloneNode(true);
+    $$('button,img', c).forEach((x) => x.remove());
+    $$('br', c).forEach((x) => x.replaceWith(' '));
+    return c.textContent.replace(/\s+/g, ' ').trim();
+  }).filter((_, i) => keep[i]));
+  return { head, rows };
+}
+function downloadCsv(name, head, rows) {
+  const q = (v) => { const t = String(v ?? ''); return /[",\r\n]/.test(t) ? `"${t.replace(/"/g, '""')}"` : t; };
+  const text = '\ufeff' + [head, ...rows].map((r) => r.map(q).join(',')).join('\r\n');
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([text], { type: 'text/csv;charset=utf-8' }));
+  a.download = name.replace(/[\\/:*?"<>|]/g, '_') + '.csv';
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+}
+// 用浏览器打印成 A4 表格（选默认打印机或"另存为 PDF"）
+function printTables(title, sub, tables) {
+  const body = tables.map(({ name, head, rows }) => `${name ? `<h2>${esc(name)}</h2>` : ''}<table><thead><tr>${head.map((h) => `<th>${esc(h)}</th>`).join('')}</tr></thead>
+    <tbody>${rows.map((r) => `<tr>${r.map((c) => `<td>${esc(c)}</td>`).join('')}</tr>`).join('') || `<tr><td colspan="${head.length}">（没有数据）</td></tr>`}</tbody></table>`).join('');
+  const html = `<!doctype html><html><head><meta charset="utf-8"><title>${esc(title)}</title><style>
+    @page{size:A4;margin:12mm} body{font:12px/1.5 "Microsoft YaHei","PingFang SC",sans-serif;color:#000;margin:0}
+    h1{font-size:18px;margin:0 0 2px} .sub{color:#444;margin-bottom:10px} h2{font-size:14px;margin:14px 0 6px}
+    table{border-collapse:collapse;width:100%} th,td{border:1px solid #888;padding:4px 6px;text-align:left;vertical-align:top} th{background:#eee}
+    tr{page-break-inside:avoid}
+  </style></head><body><h1>${esc(title)}</h1><div class="sub">${esc(sub)}</div>${body}</body></html>`;
+  const f = document.createElement('iframe');
+  f.setAttribute('aria-hidden', 'true');
+  f.style.cssText = 'position:fixed;right:0;bottom:0;width:0;height:0;border:0;visibility:hidden';
+  f.onload = () => { const w = f.contentWindow; w.addEventListener('afterprint', () => setTimeout(() => f.remove(), 500)); setTimeout(() => f.remove(), 120000); w.focus(); w.print(); };
+  f.srcdoc = html;
+  document.body.appendChild(f);
+}
+// 给区域里每个表格卡片底部加"导出 Excel""打印"按钮；ctx 是说明（例如日期）
+function tableTools(root, page, ctx = '') {
+  $$('.card.tbl', root).forEach((card) => {
+    const table = $('table', card);
+    if (!table || $('.ttools', card)) return;
+    const h = $('h3', card);
+    const name = h ? h.childNodes[0].textContent.trim() : '';
+    const title = `${page}${name && name !== page ? ' · ' + name : ''}`;
+    const bar = document.createElement('div');
+    bar.className = 'ttools';
+    bar.innerHTML = '<button class="btn small" data-t="csv">导出 Excel</button><button class="btn small" data-t="print">打印</button>';
+    card.appendChild(bar);
+    const sub = () => `${state.me.shop_name}　${typeof ctx === 'function' ? ctx() : ctx}　打印时间 ${dateStr()} ${new Date().toTimeString().slice(0, 5)}`;
+    $('[data-t=csv]', bar).onclick = () => { const d = tableData(table); downloadCsv(`${title}_${typeof ctx === 'function' ? ctx() : ctx || dateStr()}`, d.head, d.rows); };
+    $('[data-t=print]', bar).onclick = () => { const d = tableData(table); printTables(title, sub(), [d]); };
+  });
+}
+
 // ---------- 页面注册 ----------
 const VIEWS = [
   { key: 'pos', label: '收银', roles: ['owner', 'cashier'], render: renderPos },
@@ -121,7 +182,7 @@ const VIEWS = [
   { key: 'production', label: '出品', roles: ['owner', 'kitchen'], render: renderProduction },
   { key: 'plan', label: '生产计划', roles: ['owner', 'kitchen'], render: renderPlan },
   { key: 'stock', label: '盘存', roles: ['owner', 'kitchen'], render: renderStock },
-  { key: 'tickets', label: '餐票兑换', roles: ['owner'], render: renderTickets },
+  { key: 'tickets', label: '餐票', roles: ['owner'], render: renderTickets },
   { key: 'reports', label: '报表', roles: ['owner'], render: renderReports },
   { key: 'settings', label: '设置', roles: ['owner'], render: renderSettings },
 ];
@@ -192,8 +253,13 @@ async function renderLogin(app) {
 
 // ---------- 收银 ----------
 async function renderPos(main) {
-  await act(async () => { state.products = await api('GET', '/api/products'); });
-  const prods = state.products.filter((p) => p.active);
+  await act(async () => {
+    const [products, me] = await Promise.all([api('GET', '/api/products'), api('GET', '/api/me')]);
+    state.products = products; state.me = me;
+  });
+  if (state.discount === undefined || !state.me.discount.on) state.discount = state.me.discount.all;
+  // 按近 30 天销量排序，卖得多的在前
+  const prods = state.products.filter((p) => p.active).sort((a, b) => b.sold_30d - a.sold_30d || a.sort - b.sort || a.id - b.id);
   const cats = ['全部', ...new Set(prods.map((p) => p.category))];
   if (!cats.includes(state.cat)) state.cat = '全部';
   main.innerHTML = `<div class="pos">
@@ -229,9 +295,29 @@ async function renderPos(main) {
   };
   drawCart();
 }
-const cartTotal = () => state.cart.reduce((s, l) => s + l.qty * l.price_cents, 0);
+const cartSubtotal = () => state.cart.reduce((s, l) => s + l.qty * l.price_cents, 0);
+const cartTotal = () => { const s = cartSubtotal(); return state.discount ? Math.round(s * state.discount / 100) : s; };
+function discountHtml() {
+  const d = state.me.discount;
+  if (!d.on) return '';
+  const cur = state.discount;
+  const custom = cur && !d.presets.includes(cur);
+  return `<div class="disc">
+    <div class="discbtns"><button data-disc="" class="${cur ? '' : 'on'}">原价</button>${d.presets.map((p) => `<button data-disc="${p}" class="${cur === p ? 'on' : ''}">${zhe(p)}</button>`).join('')}<button data-disc="custom" class="${custom ? 'on' : ''}">${custom ? zhe(cur) : '其他'}</button></div>
+    <label class="discall"><input type="checkbox" id="discall" ${d.all ? 'checked' : ''}> 全部订单打折${d.all ? `（现在每单都打 ${zhe(d.all)}）` : ''}</label></div>`;
+}
+async function setDiscount(pct) {
+  state.discount = pct;
+  if (state.me.discount.all && pct) {
+    await act(async () => { state.me.discount = await api('POST', '/api/discount-all', { pct }); });
+  } else if (state.me.discount.all && !pct) {
+    await act(async () => { state.me.discount = await api('POST', '/api/discount-all', { pct: null }); });
+  }
+  drawCart();
+}
 function drawCart() {
   const el = $('#cart'); if (!el) return;
+  const sub = cartSubtotal();
   const total = cartTotal();
   const lo = state.lastOrder;
   el.innerHTML = `
@@ -245,6 +331,8 @@ function drawCart() {
       <label class="btn small" style="display:inline-flex;align-items:center;gap:6px;cursor:pointer">📷 ${state.photo ? '换照片' : '拍照'}<input type="file" accept="image/*" capture="environment" id="photo" hidden></label>
       ${state.photo ? `<img class="thumb sm" src="${state.photo}" alt="商品照片"><button class="btn small" id="rmphoto">删除照片</button>` : '<span class="muted" style="font-size:12px">存票消费时建议拍照</span>'}
     </div>
+    ${discountHtml()}
+    ${state.discount && sub ? `<div class="row between muted" style="font-size:14px"><span>原价 <span class="num">¥${yuan(sub)}</span>　${zhe(state.discount)}</span><span class="num">优惠 −${yuan(sub - total)}</span></div>` : ''}
     <div class="total"><span>合计</span><span class="num">¥${yuan(total)}</span></div>
     <div class="paybtns">${Object.entries(METHOD).map(([k, v]) => `<button class="m-${k}" data-pay="${k}" ${state.cart.length ? '' : 'disabled'}>${v}</button>`).join('')}</div>`;
   $$('[data-inc]', el).forEach((b) => b.onclick = () => { state.cart[b.dataset.inc].qty++; drawCart(); });
@@ -254,6 +342,31 @@ function drawCart() {
   const rp = $('#rmphoto', el); if (rp) rp.onclick = () => { state.photo = null; drawCart(); };
   $$('[data-pay]', el).forEach((b) => b.onclick = () => payFlow(b.dataset.pay));
   const pl = $('#printlast', el); if (pl) pl.onclick = () => printReceipt('order', { id: lo.id });
+  $$('[data-disc]', el).forEach((b) => b.onclick = () => {
+    const v = b.dataset.disc;
+    if (v !== 'custom') return setDiscount(v ? Number(v) : null);
+    const m = modal(`<h3>其他折扣</h3><label class="f"><span>打几折（例如 7.5 表示 7.5 折）</span><input id="z" inputmode="decimal"></label>
+      <div class="acts"><button class="btn" data-close>取消</button><button class="btn primary" id="ok">确定</button></div>`);
+    $('#ok', m.el).onclick = () => {
+      const pct = Math.round(parseFloat($('#z', m.el).value) * 10);
+      if (!(pct >= 1 && pct <= 99)) return toast('请填 0.1 到 9.9 之间的数', true);
+      m.close(); setDiscount(pct);
+    };
+  });
+  const da = $('#discall', el);
+  if (da) da.onchange = () => act(async () => {
+    if (da.checked) {
+      const pct = state.discount || state.me.discount.presets[0];
+      state.me.discount = await api('POST', '/api/discount-all', { pct });
+      state.discount = pct;
+      toast(`已开启：每一单都打 ${zhe(pct)}`);
+    } else {
+      state.me.discount = await api('POST', '/api/discount-all', { pct: null });
+      state.discount = null;
+      toast('已关闭全部打折');
+    }
+    drawCart();
+  });
   const mb = $('#mbar');
   if (mb) {
     const n = state.cart.reduce((s, l) => s + l.qty, 0);
@@ -267,10 +380,10 @@ async function submitOrder(payments, m) {
   return act(async () => {
     const r = await api('POST', '/api/orders', {
       items: state.cart.map((l) => ({ product_id: l.product_id, name: l.name, price_cents: l.price_cents, qty: l.qty })),
-      payments, photo: state.photo,
+      payments, photo: state.photo, discount_pct: state.discount || null,
     });
     m && m.close();
-    state.cart = []; state.photo = null; state.lastOrder = r; drawCart();
+    state.cart = []; state.photo = null; state.lastOrder = r; state.discount = state.me.discount.all; drawCart();
     toast(r.overpay_cents ? `已收款：餐票 ¥${yuan(r.paid_cents)}，多出 ¥${yuan(r.overpay_cents)} 不找零` : `已收款 ¥${yuan(r.total_cents)}`);
     const auto = state.me.print.auto;
     if (canPrint() && (auto === 'all' || (auto === 'stored' && r.has_stored))) printReceipt('order', { id: r.id });
@@ -415,6 +528,7 @@ async function renderAccounts(main) {
       || '<tr><td colspan="6" class="empty">还没有存票账户</td></tr>';
     $$('[data-aid]').forEach((tr) => tr.onclick = () => accountDetail(Number(tr.dataset.aid), load));
   };
+  tableTools(main, '存票账户', () => ($('#aq').value.trim() ? `搜索：${$('#aq').value.trim()}` : dateStr()));
   let t; $('#aq').oninput = () => { clearTimeout(t); t = setTimeout(load, 250); };
   $('#newacc').onclick = () => {
     const m = modal(`<h3>存票开户</h3>
@@ -473,7 +587,7 @@ async function accountDetail(id, reload) {
 // ---------- 订单 ----------
 async function renderOrders(main) {
   const owner = state.me.role === 'owner';
-  main.innerHTML = `<div class="stack"><div class="row"><input type="date" id="od" value="${dateStr()}" style="max-width:200px" ${owner ? '' : 'max="' + dateStr() + '"'}></div><div id="ostats"></div><div class="card tbl" id="olist"></div></div>`;
+  main.innerHTML = `<div class="stack"><div class="row"><input type="date" id="od" value="${dateStr()}" style="max-width:200px" ${owner ? '' : 'max="' + dateStr() + '"'}></div><div id="ostats"></div><div id="owrap"><div class="card tbl" id="olist"></div></div></div>`;
   const load = async () => {
     const d = $('#od').value;
     const rows = await api('GET', `/api/orders?from=${d}&to=${d}`).catch((e) => { toast(e.message, true); return []; });
@@ -484,14 +598,16 @@ async function renderOrders(main) {
     $('#ostats').innerHTML = `<div class="stats">${Object.entries(METHOD).map(([k, v]) => `<div class="stat m-${k}"><span class="k">${v}${k === 'ticket' && over ? `（含溢收 ${yuan(over)}）` : ''}</span><span class="v">¥${yuan(by[k])}</span></div>`).join('')}
       <div class="stat"><span class="k">有效单数</span><span class="v">${done.length}</span></div></div>`;
     const actions = owner || canPrint();
+    $('#owrap').innerHTML = '<div class="card tbl" id="olist"></div>';
     $('#olist').innerHTML = `<table><thead><tr><th>时间</th><th>商品</th><th class="r">金额</th><th>收款</th><th>照片</th><th>收银员</th>${actions ? '<th></th>' : ''}</tr></thead><tbody>
       ${rows.map((o) => `<tr class="${o.status === 'void' ? 'void' : ''}"><td class="muted">${esc(o.created_at.slice(11, 16))}</td>
         <td>${o.items.map((i) => `${esc(i.name)}×${i.qty}`).join('、')}${o.status === 'void' ? `<br><span class="pill bad">已撤销：${esc(o.void_reason)}</span>` : ''}</td>
-        <td class="r num">${yuan(o.total_cents)}</td>
+        <td class="r num">${yuan(o.total_cents)}${o.discount_cents ? `<br><span class="pill">${zhe(o.discount_pct)} −${yuan(o.discount_cents)}</span>` : ''}</td>
         <td>${o.payments.map((p) => `<span class="pill m-${p.method}">${p.detail === '餐票找零' ? '找零' : METHOD[p.method]} ${yuan(p.amount_cents)}${p.account_name ? ' · ' + esc(p.account_name) : ''}</span>`).join(' ')}${o.overpay_cents ? ` <span class="pill">溢收 ${yuan(o.overpay_cents)}</span>` : ''}</td>
         <td>${o.photo ? `<img class="thumb sm" src="/photos/${esc(o.photo)}" alt="照片">` : ''}</td><td class="muted">${esc(o.cashier_name)}</td>
         ${actions ? `<td><div class="row" style="gap:4px;flex-wrap:nowrap">${canPrint() ? `<button class="btn small" data-print="${o.id}">打印</button>` : ''}${owner && o.status === 'done' ? `<button class="btn small danger" data-void="${o.id}">撤单</button>` : ''}</div></td>` : ''}</tr>`).join('') || `<tr><td colspan="7" class="empty">这天没有订单</td></tr>`}
       </tbody></table>`;
+    tableTools($('#ostats').parentNode, '订单', () => d);
     $$('[data-print]').forEach((b) => b.onclick = () => printReceipt('order', { id: Number(b.dataset.print) }));
     $$('[data-void]').forEach((b) => b.onclick = () => {
       const m = modal(`<h3>撤销订单</h3><p class="muted">存票扣款会退回账户，这单不再计入统计。</p><label class="f"><span>原因</span><input id="r"></label>
@@ -510,29 +626,81 @@ async function renderClose(main) {
     const r = await api('GET', '/api/dayclose?date=' + $('#cd').value).catch((e) => toast(e.message, true));
     if (!r) return;
     const s = r.system; const sv = r.saved;
+    // 店内余票：今天按餐票库现有张数核对；以前的日期看当时保存的记录
+    const isToday = r.date === r.today;
+    const tk = isToday ? r.tickets_now.map((t) => {
+      const old = sv && sv.tickets ? sv.tickets.rows.find((x) => x.face_cents === t.face_cents) : null;
+      return { face_cents: t.face_cents, system: t.count, actual: old ? old.actual : null };
+    }) : (sv && sv.tickets ? sv.tickets.rows : null);
     $('#cbody').innerHTML = `
       <div class="stats">${Object.entries(METHOD).map(([k, v]) => `<div class="stat m-${k}"><span class="k">${v} · ${s.orders_by_method[k]} 单</span><span class="v">¥${yuan(s.amounts[k])}</span></div>`).join('')}
         <div class="stat"><span class="k">四种来源合计 · ${s.orders} 单</span><span class="v">¥${yuan(s.paid_cents)}</span></div></div>
-      <p class="muted">商品金额 ¥${yuan(s.total_cents)}${s.overpay_cents ? `，餐票溢收 ¥${yuan(s.overpay_cents)}（已算在临时用票里）` : ''}。当天另有存票存入 ¥${yuan(s.deposits_cents)}（不算营业额）${s.voided ? `，撤销 ${s.voided} 单` : ''}。</p>
+      <p class="muted">商品金额 ¥${yuan(s.total_cents)}${s.discount_cents ? `（打折优惠 ¥${yuan(s.discount_cents)}）` : ''}${s.overpay_cents ? `，餐票溢收 ¥${yuan(s.overpay_cents)}（已算在临时用票里）` : ''}。当天另有存票存入 ¥${yuan(s.deposits_cents)}（不算营业额）${s.voided ? `，撤销 ${s.voided} 单` : ''}。</p>
       <div class="card"><h3>对账</h3><div class="grid2">
         <label class="f"><span>实点现金（元）· 系统 ¥${yuan(s.amounts.cash)}</span><input id="ca" inputmode="decimal" value="${sv ? yuan(sv.cash_actual_cents) : ''}"></label>
         <label class="f"><span>学校收银机小票合计（元）· 系统 ¥${yuan(s.amounts.pos)}</span><input id="pa" inputmode="decimal" value="${sv ? yuan(sv.pos_actual_cents) : ''}"></label></div>
+        <h3 style="margin-top:4px">店内余票</h3>
+        ${tk ? `<div class="tbl"><table id="tktbl"><thead><tr><th>面额</th><th class="r">系统应有（张）</th><th class="r">实点（张）</th><th class="r">差异</th></tr></thead><tbody>
+          ${tk.map((t) => `<tr><td>${faceText(t.face_cents)} 元票</td><td class="r num">${t.system}</td>
+            <td class="r">${isToday ? `<input data-tk="${t.face_cents}" inputmode="numeric" value="${t.actual ?? ''}" style="width:90px;text-align:right">` : `<span class="num">${t.actual ?? '—'}</span>`}</td>
+            <td class="r num" data-tkd="${t.face_cents}"></td></tr>`).join('')}
+          <tr><td><b>合计金额</b></td><td class="r num">¥${yuan(tk.reduce((a, t) => a + t.face_cents * t.system, 0))}</td><td class="r num" id="tkact"></td><td></td></tr></tbody></table></div>
+          <p class="muted" style="font-size:13px">系统应有 = 收到的临时用票和存票纸票，减去已兑换现金和拿去其他档口用掉的。${isToday ? '' : '这是当天日结时的记录。'}</p>`
+          : '<p class="muted">这天日结时没有清点余票。</p>'}
         <p id="diff"></p>
         <label class="f"><span>差额原因（有差额时必填）</span><input id="cn" value="${esc(sv ? sv.note : '')}"></label>
         <div class="row between"><span class="muted">${sv ? `已于 ${esc(sv.closed_at)} 由 ${esc(sv.closed_by)} 日结` : '今天还没日结'}</span>
-          <span class="row">${canPrint() ? '<button class="btn" id="cprint">打印日结单</button>' : ''}<button class="btn primary" id="save">${sv ? '更新日结' : '保存日结'}</button></span></div>
+          <span class="row"><button class="btn" id="cexp">导出 Excel</button><button class="btn" id="ca4">打印（A4）</button>${canPrint() ? '<button class="btn" id="cprint">打印小票</button>' : ''}<button class="btn primary" id="save">${sv ? '更新日结' : '保存日结'}</button></span></div>
         <p class="muted" style="font-size:13px">若钱箱里有备用零钱，请先减去再填实点现金。</p></div>`;
     const diff = () => {
       const c = toCents($('#ca').value); const p = toCents($('#pa').value);
       const parts = [];
       if (Number.isFinite(c)) parts.push(`现金差额 <b class="num ${c - s.amounts.cash ? 'warn' : 'ok'}">${yuan(c - s.amounts.cash)}</b>`);
       if (Number.isFinite(p)) parts.push(`收银机差额 <b class="num ${p - s.amounts.pos ? 'warn' : 'ok'}">${yuan(p - s.amounts.pos)}</b>`);
+      if (tk) {
+        let n = 0; let filled = false; let actSum = 0;
+        tk.forEach((t) => {
+          const inp = $(`[data-tk="${t.face_cents}"]`);
+          const v = inp ? (inp.value.trim() === '' ? null : parseInt(inp.value, 10)) : t.actual;
+          const cell = $(`[data-tkd="${t.face_cents}"]`);
+          if (v === null || Number.isNaN(v)) { cell.textContent = ''; return; }
+          filled = true; actSum += v * t.face_cents;
+          const dd = v - t.system; n += Math.abs(dd);
+          cell.innerHTML = `<span class="${dd ? 'warn' : 'ok'}">${dd > 0 ? '+' : ''}${dd}</span>`;
+        });
+        $('#tkact').textContent = filled ? '¥' + yuan(actSum) : '';
+        if (filled) parts.push(`余票 <b class="${n ? 'warn' : 'ok'}">${n ? `差 ${n} 张` : '相符'}</b>`);
+      }
       $('#diff').innerHTML = parts.join('　');
     };
-    $('#ca').oninput = diff; $('#pa').oninput = diff; diff();
+    $('#ca').oninput = diff; $('#pa').oninput = diff; $$('[data-tk]').forEach((i) => { i.oninput = diff; }); diff();
     const cp = $('#cprint'); if (cp) cp.onclick = () => printReceipt('dayclose', { date: $('#cd').value });
+    // 日结单（A4 / Excel）：按页面上现在填的数
+    const closeTables = () => {
+      const c = toCents($('#ca').value); const p = toCents($('#pa').value);
+      const t1 = { name: '收款', head: ['项目', '单数', '金额'], rows: [
+        ...Object.entries(METHOD).map(([k, v]) => [v, s.orders_by_method[k], yuan(s.amounts[k])]),
+        ['四种来源合计', s.orders, yuan(s.paid_cents)], ['商品金额', '', yuan(s.total_cents)],
+        ...(s.discount_cents ? [['打折优惠', '', yuan(s.discount_cents)]] : []), ...(s.overpay_cents ? [['餐票溢收（含在临时用票里）', '', yuan(s.overpay_cents)]] : []),
+        ['当天存票存入（不算营业额）', '', yuan(s.deposits_cents)], ...(s.voided ? [['撤销单数', s.voided, '']] : [])] };
+      const t2 = { name: '对账', head: ['项目', '系统', '实际', '差额'], rows: [
+        ['现金', yuan(s.amounts.cash), Number.isFinite(c) ? yuan(c) : '', Number.isFinite(c) ? yuan(c - s.amounts.cash) : ''],
+        ['学校收银机', yuan(s.amounts.pos), Number.isFinite(p) ? yuan(p) : '', Number.isFinite(p) ? yuan(p - s.amounts.pos) : '']] };
+      const out = [t1, t2];
+      if ($('#tktbl')) { const d = tableData($('#tktbl')); out.push({ name: '店内余票', ...d }); }
+      if ($('#cn').value.trim()) out.push({ name: '备注', head: ['差额原因'], rows: [[$('#cn').value.trim()]] });
+      return out;
+    };
+    $('#ca4').onclick = () => printTables(`日结单 ${r.date}`, `${state.me.shop_name}　${sv ? `${sv.closed_by} 于 ${sv.closed_at} 日结` : '还没保存日结'}`, closeTables());
+    $('#cexp').onclick = () => {
+      const rows = [];
+      closeTables().forEach((t) => { rows.push([`【${t.name}】`], t.head, ...t.rows, []); });
+      downloadCsv(`日结单_${r.date}`, [`${state.me.shop_name} 日结单 ${r.date}`], rows);
+    };
     $('#save').onclick = () => act(async () => {
-      await api('POST', '/api/dayclose', { date: $('#cd').value, cash_actual_cents: toCents($('#ca').value), pos_actual_cents: toCents($('#pa').value), note: $('#cn').value });
+      const tickets_actual = $$('[data-tk]').map((i) => ({ face_cents: Number(i.dataset.tk), count: i.value.trim() === '' ? null : parseInt(i.value, 10) }));
+      if (tickets_actual.some((t) => t.count !== null && !(t.count >= 0))) throw new Error('余票张数要填整数');
+      await api('POST', '/api/dayclose', { date: $('#cd').value, cash_actual_cents: toCents($('#ca').value), pos_actual_cents: toCents($('#pa').value), note: $('#cn').value, tickets_actual });
       toast('日结已保存'); load();
     });
   };
@@ -545,30 +713,68 @@ async function renderProduction(main) {
   const prods = (await api('GET', '/api/products').catch(() => [])).filter((p) => p.active);
   main.innerHTML = `<div class="stack">
     <div class="row"><input type="date" id="pd" value="${dateStr()}" style="max-width:200px"><span class="muted">收银和出品暂不关联，这里单独登记后厨数据。</span></div>
-    <div class="card"><h3>登记</h3><div class="grid2">
-      <label class="f"><span>商品</span><select id="pp">${prods.map((p) => `<option value="${p.id}">${esc(p.name)}</option>`).join('')}</select></label>
+    <div class="card"><h3>登记出品</h3><div class="grid2">
+      <label class="f"><span>商品</span><select id="pp">${prods.map((p) => `<option value="${p.id}">${esc(p.name)}</option>`).join('')}<option value="new">＋ 新品（还没有这个商品）</option></select></label>
+      <label class="f newp hidden"><span>新品名称</span><input id="nn"></label>
+      <label class="f newp hidden"><span>售价（元）</span><input id="np" inputmode="decimal"></label>
+      <label class="f newp hidden"><span>分类（可不填）</span><input id="nc" placeholder="新品"></label>
       <label class="f"><span>类型</span><select id="pt"><option value="output">出炉</option><option value="loss">报损</option><option value="leftover">收档剩余</option></select></label>
       <label class="f"><span>数量</span><input id="pq" inputmode="numeric"></label>
       <label class="f"><span>备注</span><input id="pn" placeholder="报损原因等"></label></div>
+      <p class="muted newp hidden" style="font-size:13px">新品登记后会自动加到"设置 → 商品"里，收银页面也能直接卖。</p>
       <div><button class="btn primary" id="padd">登记</button></div></div>
     <div id="pbody"></div></div>`;
+  const newShow = () => $$('.newp').forEach((el) => el.classList.toggle('hidden', $('#pp').value !== 'new'));
+  $('#pp').onchange = newShow;
   const load = async () => {
-    const r = await api('GET', '/api/production?date=' + $('#pd').value).catch((e) => toast(e.message, true));
+    const d = $('#pd').value;
+    const r = await api('GET', '/api/production?date=' + d).catch((e) => toast(e.message, true));
     if (!r) return;
-    const sum = {};
-    for (const p of r.plan) sum[p.name] = { plan: p.qty, output: 0, loss: 0, leftover: 0 };
-    for (const l of r.logs) { sum[l.name] = sum[l.name] || { plan: 0, output: 0, loss: 0, leftover: 0 }; sum[l.name][l.type] += l.qty; }
-    $('#pbody').innerHTML = `<div class="card tbl"><h3>当天汇总</h3><table><thead><tr><th>商品</th><th class="r">计划</th><th class="r">出炉</th><th class="r">报损</th><th class="r">收档剩余</th></tr></thead><tbody>
-      ${Object.entries(sum).map(([n, v]) => `<tr><td>${esc(n)}</td><td class="r num">${v.plan || '—'}</td><td class="r num">${v.output}</td><td class="r num">${v.loss}</td><td class="r num">${v.leftover}</td></tr>`).join('') || '<tr><td colspan="5" class="empty">还没有登记</td></tr>'}
+    // 出品表：前一天保存的生产计划 + 当天登记过的其他商品
+    const rows = new Map();
+    for (const p of r.plan) rows.set(p.product_id, { id: p.product_id, name: p.name, plan: p.qty, output: 0, loss: 0, leftover: 0 });
+    for (const l of r.logs) {
+      if (!rows.has(l.product_id)) rows.set(l.product_id, { id: l.product_id, name: l.name, plan: null, output: 0, loss: 0, leftover: 0 });
+      rows.get(l.product_id)[l.type] += l.qty;
+    }
+    const list = [...rows.values()];
+    const tot = (k) => list.reduce((a, x) => a + (x[k] || 0), 0);
+    $('#pbody').innerHTML = `<div class="card tbl"><h3>出品表 <span class="muted" style="font-weight:400;font-size:13px">${r.plan.length ? '计划数来自前一天保存的生产计划' : '这天没有生产计划，在"生产计划"页保存后会自动列在这里'}</span></h3>
+      <table><thead><tr><th>商品</th><th class="r">计划</th><th class="r">出炉</th><th class="r">还差</th><th class="r">报损</th><th class="r">收档剩余</th><th></th></tr></thead><tbody>
+      ${list.map((x) => `<tr><td><b>${esc(x.name)}</b>${x.plan === null ? ' <span class="pill">计划外</span>' : ''}</td><td class="r num">${x.plan ?? '—'}</td><td class="r num">${x.output}</td>
+        <td class="r num">${x.plan === null ? '—' : x.plan - x.output > 0 ? `<span class="warn">${x.plan - x.output}</span>` : '<span class="ok">0</span>'}</td><td class="r num">${x.loss}</td><td class="r num">${x.leftover}</td>
+        <td><div class="row" style="gap:4px;flex-wrap:nowrap"><input data-q="${x.id}" inputmode="numeric" placeholder="数量" style="width:72px;min-height:32px;padding:4px 8px">
+          <button class="btn small" data-add="${x.id}" data-type="output">出炉</button><button class="btn small" data-add="${x.id}" data-type="loss">报损</button><button class="btn small" data-add="${x.id}" data-type="leftover">剩余</button></div></td></tr>`).join('')
+        || '<tr><td colspan="7" class="empty">还没有计划，也还没有登记</td></tr>'}
+      ${list.length ? `<tr><td><b>合计</b></td><td class="r num">${tot('plan')}</td><td class="r num">${tot('output')}</td><td></td><td class="r num">${tot('loss')}</td><td class="r num">${tot('leftover')}</td><td></td></tr>` : ''}
       </tbody></table></div>
-      <div class="card tbl"><h3>明细</h3><table><thead><tr><th>时间</th><th>商品</th><th>类型</th><th class="r">数量</th><th>备注</th><th>登记人</th><th></th></tr></thead><tbody>
+      <div class="card tbl"><h3>登记明细</h3><table><thead><tr><th>时间</th><th>商品</th><th>类型</th><th class="r">数量</th><th>备注</th><th>登记人</th><th></th></tr></thead><tbody>
       ${r.logs.map((l) => `<tr><td class="muted">${esc(l.created_at.slice(11, 16))}</td><td>${esc(l.name)}</td><td>${PROD_TYPE[l.type]}</td><td class="r num">${l.qty}</td><td>${esc(l.note)}</td><td class="muted">${esc(l.operator_name)}</td><td><button class="btn small" data-del="${l.id}">删除</button></td></tr>`).join('') || '<tr><td colspan="7" class="empty">—</td></tr>'}
       </tbody></table></div>`;
+    tableTools($('#pbody'), '出品', d);
+    $$('[data-add]').forEach((b) => b.onclick = () => act(async () => {
+      const inp = $(`[data-q="${b.dataset.add}"]`);
+      const qty = parseInt(inp.value, 10);
+      if (!(qty > 0)) { inp.focus(); throw new Error('请先在这一行填数量'); }
+      await api('POST', '/api/production', { date: d, product_id: Number(b.dataset.add), type: b.dataset.type, qty });
+      toast(`已登记${PROD_TYPE[b.dataset.type]} ${qty}`); load();
+    }));
     $$('[data-del]').forEach((b) => b.onclick = () => act(async () => { if (!confirm('删除这条记录？')) return; await api('POST', `/api/production/${b.dataset.del}/delete`); load(); }));
   };
   $('#padd').onclick = () => act(async () => {
-    await api('POST', '/api/production', { date: $('#pd').value, product_id: Number($('#pp').value), type: $('#pt').value, qty: Number($('#pq').value), note: $('#pn').value });
-    $('#pq').value = ''; $('#pn').value = ''; toast('已登记'); load();
+    const base = { date: $('#pd').value, type: $('#pt').value, qty: Number($('#pq').value), note: $('#pn').value };
+    if ($('#pp').value === 'new') {
+      const r = await api('POST', '/api/production/new-product', { ...base, name: $('#nn').value, price_cents: toCents($('#np').value), category: $('#nc').value });
+      // 新品加到下拉框里
+      const o = document.createElement('option'); o.value = r.product_id; o.textContent = $('#nn').value.trim();
+      $('#pp').insertBefore(o, $('#pp option[value=new]')); $('#pp').value = String(r.product_id); newShow();
+      $('#nn').value = ''; $('#np').value = ''; $('#nc').value = '';
+      toast('新品已登记，并加到了商品里');
+    } else {
+      await api('POST', '/api/production', { ...base, product_id: Number($('#pp').value) });
+      toast('已登记');
+    }
+    $('#pq').value = ''; $('#pn').value = ''; load();
   });
   $('#pd').onchange = load;
   load();
@@ -587,10 +793,12 @@ async function renderPlan(main) {
     $('#lw').textContent = '星期' + wd[new Date(d + 'T12:00:00').getDay()];
     const r = await api('GET', '/api/plan?date=' + d).catch((e) => toast(e.message, true));
     if (!r) return;
-    $('#lbody').innerHTML = `<table><thead><tr><th>商品</th><th class="r">同星期均销</th><th class="r">近7天均销</th><th class="r">剩余+报损率</th><th class="r">建议</th><th class="r">计划</th></tr></thead><tbody>
+    $('#lbody').innerHTML = `<h3>生产计划</h3><table><thead><tr><th>商品</th><th class="r">同星期均销</th><th class="r">近7天均销</th><th class="r">剩余+报损率</th><th class="r">建议</th><th class="r">计划</th></tr></thead><tbody>
       ${r.rows.map((x) => `<tr><td>${esc(x.name)}</td><td class="r num">${x.avg_same_weekday ?? '—'}</td><td class="r num">${x.avg_7d}</td><td class="r num">${x.waste_rate}%</td><td class="r num"><b>${x.suggest}</b></td>
         <td class="r">${owner ? `<input data-plan="${x.product_id}" inputmode="numeric" value="${x.planned ?? x.suggest}" style="width:90px;text-align:right">` : `<b class="num">${x.planned ?? '未定'}</b>`}</td></tr>`).join('') || '<tr><td colspan="6" class="empty">没有在售商品</td></tr>'}
       </tbody></table>${owner ? '<div class="row" style="justify-content:flex-end;margin-top:12px"><button class="btn primary" id="lsave">保存为计划</button></div>' : ''}`;
+    $('#lbody').querySelector('.ttools')?.remove();
+    tableTools(main, '生产计划', `${d} 星期${wd[new Date(d + 'T12:00:00').getDay()]}`);
     const s = $('#lsave');
     if (s) s.onclick = () => act(async () => {
       const rows = $$('[data-plan]').map((i) => ({ product_id: Number(i.dataset.plan), qty: parseInt(i.value, 10) || 0 }));
@@ -603,7 +811,9 @@ async function renderPlan(main) {
 
 // ---------- 盘存 ----------
 async function renderStock(main) {
-  main.innerHTML = `<div class="stack"><div class="row between"><span class="muted">原料、包材、成品的进出和盘点。暂不和收银、出品自动关联。</span><button class="btn primary" id="sadd">+ 新增库存品</button></div><div id="sbody"></div></div>`;
+  main.innerHTML = `<div class="stack"><div class="row between"><span class="muted">原料、包材、成品的进出和盘点。暂不和收银、出品自动关联。</span><button class="btn primary" id="sadd">+ 新增库存品</button></div>
+    <p class="muted" style="font-size:13px;margin:0">盘点：照着"理论库存"清点，把实际数量填在"实盘"一栏（没清点的留空），再点"保存盘点"，系统按实盘数修正库存。可以先点表格下面的"打印"，打一张盘点表拿去清点。</p>
+    <div id="sbody"></div></div>`;
   const itemForm = (it = {}) => {
     const m = modal(`<h3>${it.id ? '修改' : '新增'}库存品</h3><div class="grid2">
       <label class="f"><span>名称</span><input id="n" value="${esc(it.name || '')}"></label>
@@ -633,16 +843,38 @@ async function renderStock(main) {
   const load = async () => {
     const r = await api('GET', '/api/stock').catch((e) => toast(e.message, true));
     if (!r) return;
-    $('#sbody').innerHTML = `<div class="card tbl"><table><thead><tr><th>名称</th><th>类别</th><th class="r">库存</th><th class="r">单价</th><th class="r">金额</th><th>操作</th></tr></thead><tbody>
-      ${r.items.map((it) => `<tr style="${it.active ? '' : 'opacity:.5'}"><td><b>${esc(it.name)}</b> ${it.low_qty && it.qty <= it.low_qty ? '<span class="pill bad">该补货了</span>' : ''}</td><td>${esc(it.kind)}</td>
-        <td class="r num">${Math.round(it.qty * 1000) / 1000} ${esc(it.unit)}</td><td class="r num">${yuan(it.cost_cents)}</td><td class="r num">${yuan(it.qty * it.cost_cents)}</td>
-        <td><div class="row" style="gap:4px">${Object.entries(MOVE).map(([k, v]) => `<button class="btn small" data-mv="${k}" data-id="${it.id}">${v}</button>`).join('')}<button class="btn small" data-edit="${it.id}">修改</button></div></td></tr>`).join('') || '<tr><td colspan="6" class="empty">还没有库存品，点右上角新增，例如：高筋面粉 / kg</td></tr>'}
-      </tbody></table></div>
+    const q3 = (n) => Math.round(n * 1000) / 1000;
+    $('#sbody').innerHTML = `<div class="card tbl"><h3>盘存表</h3><table><thead><tr><th>名称</th><th>类别</th><th>单位</th><th class="r">理论库存</th><th class="r">实盘</th><th class="r">差异</th><th class="r">单价</th><th class="r">金额</th><th></th></tr></thead><tbody>
+      ${r.items.filter((it) => it.active).map((it) => `<tr><td><b>${esc(it.name)}</b> ${it.low_qty && it.qty <= it.low_qty ? '<span class="pill bad">该补货了</span>' : ''}</td><td>${esc(it.kind)}</td><td>${esc(it.unit)}</td>
+        <td class="r num">${q3(it.qty)}</td><td class="r"><input data-cnt="${it.id}" data-sys="${it.qty}" inputmode="decimal" style="width:90px;text-align:right;min-height:32px;padding:4px 8px"></td><td class="r num" data-cd="${it.id}"></td>
+        <td class="r num">${yuan(it.cost_cents)}</td><td class="r num">${yuan(it.qty * it.cost_cents)}</td>
+        <td><div class="row" style="gap:4px;flex-wrap:nowrap">${['in', 'use', 'loss'].map((k) => `<button class="btn small" data-mv="${k}" data-id="${it.id}">${MOVE[k]}</button>`).join('')}<button class="btn small" data-edit="${it.id}">修改</button></div></td></tr>`).join('') || '<tr><td colspan="9" class="empty">还没有库存品，点右上角新增，例如：高筋面粉 / kg</td></tr>'}
+      </tbody></table>
+      ${r.items.some((it) => it.active) ? `<div class="row between"><label class="f" style="flex:1;min-width:200px"><span>盘点备注（可不填）</span><input id="cntnote" placeholder="例如：月底盘点"></label><button class="btn primary" id="cntsave">保存盘点</button></div>` : ''}
+      ${r.items.some((it) => !it.active) ? `<p class="muted" style="font-size:13px">已停用：${r.items.filter((it) => !it.active).map((it) => `<a href="#" data-edit="${it.id}">${esc(it.name)}</a>`).join('、')}</p>` : ''}</div>
       <div class="card tbl"><h3>最近进出</h3><table><thead><tr><th>时间</th><th>名称</th><th>类型</th><th class="r">变化</th><th>备注</th><th>登记人</th></tr></thead><tbody>
       ${r.moves.map((mv) => `<tr><td class="muted">${esc(mv.created_at.slice(5, 16))}</td><td>${esc(mv.name)}</td><td>${MOVE[mv.type]}</td><td class="r num">${mv.qty > 0 ? '+' : ''}${mv.qty} ${esc(mv.unit)}</td><td>${esc(mv.note)}</td><td class="muted">${esc(mv.operator_name)}</td></tr>`).join('') || '<tr><td colspan="6" class="empty">—</td></tr>'}
       </tbody></table></div>`;
+    tableTools($('#sbody'), '盘存', dateStr());
     $$('[data-mv]').forEach((b) => b.onclick = () => moveForm(r.items.find((x) => x.id === Number(b.dataset.id)), b.dataset.mv));
-    $$('[data-edit]').forEach((b) => b.onclick = () => itemForm(r.items.find((x) => x.id === Number(b.dataset.edit))));
+    $$('[data-edit]').forEach((b) => b.onclick = (e) => { e.preventDefault(); itemForm(r.items.find((x) => x.id === Number(b.dataset.edit))); });
+    $$('[data-cnt]').forEach((inp) => inp.oninput = () => {
+      const c = $(`[data-cd="${inp.dataset.cnt}"]`);
+      const v = parseFloat(inp.value);
+      if (inp.value.trim() === '' || !Number.isFinite(v)) { c.textContent = ''; return; }
+      const d = q3(v - Number(inp.dataset.sys));
+      c.innerHTML = `<span class="${d ? 'warn' : 'ok'}">${d > 0 ? '+' : ''}${d}</span>`;
+    });
+    const cs = $('#cntsave');
+    if (cs) cs.onclick = () => act(async () => {
+      const rows = $$('[data-cnt]').filter((i) => i.value.trim() !== '').map((i) => ({ item_id: Number(i.dataset.cnt), qty: parseFloat(i.value) }));
+      if (!rows.length) throw new Error('还没有填实盘数');
+      if (rows.some((x) => !(x.qty >= 0))) throw new Error('实盘数要填数字');
+      const res = await api('POST', '/api/stock/count', { rows, note: $('#cntnote').value });
+      const diffs = res.rows.filter((x) => x.diff);
+      toast(`盘点已保存：${res.rows.length} 项，${diffs.length ? `${diffs.length} 项有差异，库存已按实盘修正` : '全部相符'}`);
+      load();
+    });
   };
   $('#sadd').onclick = () => itemForm();
   load();
@@ -654,23 +886,44 @@ async function renderTickets(main) {
   if (!r) return;
   const soon = addDays(r.today, 7);
   main.innerHTML = `<div class="stack">
-    <div class="stats"><div class="stat m-ticket"><span class="k">手上未兑换的餐票面额</span><span class="v">¥${yuan(r.pending_total_cents)}</span></div>
+    <div class="stats"><div class="stat m-ticket"><span class="k">店里现有餐票</span><span class="v">¥${yuan(r.pending_total_cents)}</span></div>
+      <div class="stat"><span class="k">本月去学校兑换现金</span><span class="v">¥${yuan(r.month.school)}</span></div>
+      <div class="stat"><span class="k">本月拿去其他档口用</span><span class="v">¥${yuan(r.month.stall)}</span></div>
       <div class="stat m-stored"><span class="k">存票余额合计（欠顾客）</span><span class="v">¥${yuan(r.liability_cents)}</span></div></div>
-    <div class="card tbl"><div class="row between"><h3>待兑换餐票</h3><span><button class="btn small" id="selall">全选</button> <button class="btn primary" id="redeem">兑换选中的</button></span></div>
+    <p class="muted" style="margin:0">按面额：${r.by_face.map((f) => `${faceText(f.face_cents)} 元 × ${f.count} 张`).join('，') || '没有'}。店里收到的餐票有两个去处：去学校兑换现金，或者拿去食堂其他档口用。</p>
+    <div class="card tbl"><div class="row between"><h3>店里现有餐票</h3><span class="row"><button class="btn" id="stall">拿去其他档口用</button><button class="btn small" id="selall">全选</button><button class="btn primary" id="redeem">选中的去学校兑换</button></span></div>
       <table><thead><tr><th></th><th>收到时间</th><th>来源</th><th class="r">面额</th><th class="r">张数</th><th class="r">合计</th><th>有效期</th></tr></thead><tbody>
       ${r.pending.map((b) => `<tr><td><input type="checkbox" data-b="${b.id}" data-v="${b.face_cents * b.count}" style="width:20px;min-height:20px"></td><td class="muted">${esc(b.created_at.slice(0, 16))}</td><td>${b.source === 'temp' ? '临时用票' : '存票'}</td>
         <td class="r num">${yuan(b.face_cents)}</td><td class="r num">${b.count}</td><td class="r num">${yuan(b.face_cents * b.count)}</td>
         <td>${b.expire_date ? `${esc(b.expire_date)} ${b.expire_date < r.today ? '<span class="pill bad">已过期</span>' : b.expire_date <= soon ? '<span class="pill bad">快过期</span>' : ''}` : '<span class="muted">—</span>'}</td></tr>`).join('') || '<tr><td colspan="7" class="empty">没有待兑换的餐票</td></tr>'}
       </tbody></table></div>
-    <div class="card tbl"><h3>兑换记录</h3><table><thead><tr><th>时间</th><th class="r">票面合计</th><th class="r">实际换回</th><th>备注</th><th>经办</th></tr></thead><tbody>
-      ${r.redemptions.map((x) => `<tr><td class="muted">${esc(x.created_at.slice(0, 16))}</td><td class="r num">${yuan(x.face_total_cents)}</td><td class="r num">${yuan(x.received_cents)}</td><td>${esc(x.note)}</td><td class="muted">${esc(x.operator_name)}</td></tr>`).join('') || '<tr><td colspan="5" class="empty">—</td></tr>'}
+    <div class="card tbl"><h3>餐票去向记录</h3><table><thead><tr><th>时间</th><th>去向</th><th class="r">票面合计</th><th class="r">换回现金</th><th>备注</th><th>经办</th></tr></thead><tbody>
+      ${r.redemptions.map((x) => `<tr><td class="muted">${esc(x.created_at.slice(0, 16))}</td><td>${x.kind === 'stall' ? '<span class="pill m-ticket">其他档口使用</span>' : '<span class="pill m-cash">学校兑换现金</span>'}</td><td class="r num">${yuan(x.face_total_cents)}</td><td class="r num">${x.kind === 'stall' ? '—' : yuan(x.received_cents)}</td><td>${esc(x.note)}</td><td class="muted">${esc(x.operator_name)}</td></tr>`).join('') || '<tr><td colspan="6" class="empty">—</td></tr>'}
       </tbody></table></div></div>`;
+  tableTools(main, '餐票', dateStr());
+  $('#stall').onclick = () => {
+    if (!r.by_face.length) return toast('店里没有餐票', true);
+    const cnt = Object.fromEntries(r.by_face.map((f) => [f.face_cents, 0]));
+    const m = modal(`<h3>拿去食堂其他档口用</h3><p class="muted" style="font-size:13px">从最早到期的票开始扣。这部分不是兑换现金，会单独记录。</p>
+      ${r.by_face.map((f) => `<div class="counter"><b>${faceText(f.face_cents)} 元票 <span class="muted" style="font-weight:400">店里有 ${f.count} 张</span></b><span class="qty"><button data-d="${f.face_cents}">−</button><span class="num" id="u${f.face_cents}">0</span><button data-i="${f.face_cents}">+</button></span></div>`).join('')}
+      <p id="usum" class="muted">合计：¥0.00</p>
+      <label class="f"><span>用在哪个档口、买了什么</span><input id="un" placeholder="例如：二楼面档 买面粉 / 员工餐"></label>
+      <div class="acts"><button class="btn" data-close>取消</button><button class="btn primary" id="ok">确认</button></div>`);
+    const upd = () => { r.by_face.forEach((f) => { $('#u' + f.face_cents, m.el).textContent = cnt[f.face_cents]; }); $('#usum', m.el).textContent = `合计：¥${yuan(r.by_face.reduce((a, f) => a + f.face_cents * cnt[f.face_cents], 0))}`; };
+    $$('[data-i]', m.el).forEach((b) => b.onclick = () => { const f = r.by_face.find((x) => x.face_cents === Number(b.dataset.i)); if (cnt[f.face_cents] < f.count) cnt[f.face_cents]++; upd(); });
+    $$('[data-d]', m.el).forEach((b) => b.onclick = () => { if (cnt[b.dataset.d] > 0) cnt[b.dataset.d]--; upd(); });
+    $('#ok', m.el).onclick = () => act(async () => {
+      const tickets = r.by_face.filter((f) => cnt[f.face_cents] > 0).map((f) => ({ face_cents: f.face_cents, count: cnt[f.face_cents] }));
+      await api('POST', '/api/ticket-use', { tickets, note: $('#un', m.el).value });
+      m.close(); toast('已记录'); renderTickets(main);
+    });
+  };
   $('#selall').onclick = () => { const cbs = $$('[data-b]'); const on = !cbs.every((c) => c.checked); cbs.forEach((c) => { c.checked = on; }); };
   $('#redeem').onclick = () => {
     const sel = $$('[data-b]').filter((c) => c.checked);
     if (!sel.length) return toast('请先勾选餐票', true);
     const face = sel.reduce((s, c) => s + Number(c.dataset.v), 0);
-    const m = modal(`<h3>去学校兑换</h3><p>选中票面合计 <b class="num">¥${yuan(face)}</b></p>
+    const m = modal(`<h3>去学校兑换现金</h3><p>选中票面合计 <b class="num">¥${yuan(face)}</b></p>
       <label class="f"><span>实际换回金额（元）</span><input id="v" inputmode="decimal" value="${yuan(face)}"></label>
       <label class="f"><span>备注</span><input id="n"></label>
       <div class="acts"><button class="btn" data-close>取消</button><button class="btn primary" id="ok">确认兑换</button></div>`);
@@ -707,14 +960,15 @@ async function renderReports(main) {
     $('#rbody').innerHTML = `
       <div class="stats"><div class="stat"><span class="k">四种来源合计 · ${r.totals.orders} 单</span><span class="v">¥${yuan(Object.values(by).reduce((a, b) => a + b, 0))}</span></div>
         ${Object.entries(METHOD).map(([k, v]) => `<div class="stat m-${k}"><span class="k">${v} · ${Math.round(Math.max(by[k], 0) / sumM * 100)}%</span><span class="v">¥${yuan(by[k])}</span></div>`).join('')}</div>
-      <p class="muted" style="font-size:13px">商品金额 ¥${yuan(r.totals.amount)}${r.totals.overpay ? `，餐票溢收 ¥${yuan(r.totals.overpay)}（票面多出不找零的部分，已算在临时用票里）` : ''}。存票余额消费是顾客预存的餐票，不是当天新收的钱。${by.cash < 0 ? '现金为负数是因为第一版曾经用现金给餐票找零。' : ''}</p>
+      <p class="muted" style="font-size:13px">商品金额 ¥${yuan(r.totals.amount)}${r.totals.discount ? `（已减去打折优惠 ¥${yuan(r.totals.discount)}；下面商品销量的金额按原价算）` : ''}${r.totals.overpay ? `，餐票溢收 ¥${yuan(r.totals.overpay)}（票面多出不找零的部分，已算在临时用票里）` : ''}。存票余额消费是顾客预存的餐票，不是当天新收的钱。${by.cash < 0 ? '现金为负数是因为第一版曾经用现金给餐票找零。' : ''}</p>
       <div class="card tbl"><h3>每日分来源</h3><table><thead><tr><th>日期</th>${Object.values(METHOD).map((v) => `<th class="r">${v}</th>`).join('')}<th class="r">合计</th></tr></thead><tbody>
         ${Object.entries(days).map(([d, v]) => `<tr><td>${d}</td>${Object.keys(METHOD).map((k) => `<td class="r num">${yuan(v[k])}</td>`).join('')}<td class="r num"><b>${yuan(Object.values(v).reduce((a, b) => a + b, 0))}</b></td></tr>`).join('') || '<tr><td colspan="6" class="empty">没有数据</td></tr>'}
       </tbody></table></div>
       <div class="card tbl"><h3>商品销量</h3><table><thead><tr><th>商品</th><th class="r">售出</th><th class="r">金额</th><th class="r">出炉</th><th class="r">报损</th></tr></thead><tbody>
         ${r.products.map((p) => `<tr><td>${esc(p.name)}</td><td class="r num">${p.qty}</td><td class="r num">${yuan(p.amount)}</td><td class="r num muted">${prodMap[p.name] ? prodMap[p.name].output : '—'}</td><td class="r num muted">${prodMap[p.name] ? prodMap[p.name].loss : '—'}</td></tr>`).join('') || '<tr><td colspan="5" class="empty">没有数据</td></tr>'}
       </tbody></table><p class="muted" style="font-size:13px">出炉、报损来自出品页登记，仅作对照。</p></div>
-      <div class="card"><h3>时段分布</h3>${r.hours.map((h) => `<div class="row" style="flex-wrap:nowrap"><span class="num" style="width:48px">${h.hour}点</span><div class="bar" style="flex:1"><i style="width:${h.amount / maxH * 100}%;background:var(--accent)"></i></div><span class="num muted" style="width:120px;text-align:right">${h.orders}单 ¥${yuan(h.amount)}</span></div>`).join('') || '<p class="muted">没有数据</p>'}</div>`;
+      <div class="card tbl"><h3>时段分布</h3><table class="hidden"><thead><tr><th>时段</th><th class="r">单数</th><th class="r">金额</th></tr></thead><tbody>${r.hours.map((h) => `<tr><td>${h.hour}点</td><td>${h.orders}</td><td>${yuan(h.amount)}</td></tr>`).join('')}</tbody></table>${r.hours.map((h) => `<div class="row" style="flex-wrap:nowrap"><span class="num" style="width:48px">${h.hour}点</span><div class="bar" style="flex:1"><i style="width:${h.amount / maxH * 100}%;background:var(--accent)"></i></div><span class="num muted" style="width:120px;text-align:right">${h.orders}单 ¥${yuan(h.amount)}</span></div>`).join('') || '<p class="muted">没有数据</p>'}</div>`;
+    tableTools($('#rbody'), '报表', `${f} 至 ${t}`);
   };
   $$('[data-range]').forEach((b) => b.onclick = () => { $('#rt').value = dateStr(); $('#rf').value = addDays(dateStr(), -Number(b.dataset.range)); load(); });
   $('#rf').onchange = load; $('#rt').onchange = load;
@@ -731,6 +985,11 @@ async function renderSettings(main) {
       <label class="f"><span>餐票面额（元，用逗号分隔）</span><input id="sf" value="${esc((settings.ticket_faces || '').split(',').filter(Boolean).map((c) => Number(c) / 100).join(','))}"></label>
       <label class="f"><span>顾客查询地址（印在存票凭条上，不填自动识别）</span><input id="sq" value="${esc(settings.query_url || '')}" placeholder="${esc(state.me.query_url)}"></label></div>
       <div><button class="btn primary" id="ssave">保存</button></div></div>
+    <div class="card"><h3>打折</h3>
+      <label class="row" style="gap:8px;cursor:pointer"><input type="checkbox" id="don" style="width:20px;min-height:20px" ${settings.discount_on === '1' ? 'checked' : ''}> 开启打折（开启后收银页面会出现打折按钮）</label>
+      <div class="grid2">${(settings.discount_presets || '90,85,80').split(',').map((v, i) => `<label class="f"><span>打折按钮 ${i + 1}（几折）</span><input data-dp inputmode="decimal" value="${Number(v) / 10}"></label>`).join('')}</div>
+      <p class="muted" style="font-size:13px">例如填 9 就是 9 折、8.5 就是 8.5 折。收银时点一下按钮这一单就打折；勾选"全部订单打折"后，每一单都自动按这个折扣，直到取消。</p>
+      <div><button class="btn primary" id="dsave">保存</button></div></div>
     <div class="card"><h3>小票打印机</h3>
       <div class="grid2">
         <label class="f"><span>打印方式</span><select id="pm">
@@ -763,6 +1022,13 @@ async function renderSettings(main) {
     <div class="card tbl"><h3>操作日志</h3><table><thead><tr><th>时间</th><th>人员</th><th>操作</th><th>内容</th></tr></thead><tbody>
       ${logs.map((l) => `<tr><td class="muted">${esc(l.created_at.slice(5, 16))}</td><td>${esc(l.user_name)}</td><td>${esc(l.action)}</td><td class="muted" style="font-size:12px;word-break:break-all">${esc(l.detail)}</td></tr>`).join('')}
       </tbody></table></div></div>`;
+  tableTools(main, '设置', dateStr());
+  $('#dsave').onclick = () => act(async () => {
+    const ps = $$('[data-dp]').map((i) => Math.round(parseFloat(i.value) * 10));
+    if (ps.some((x) => !(x >= 1 && x <= 99))) throw new Error('折扣要填 0.1 到 9.9 之间的数');
+    await api('POST', '/api/settings', { discount_on: $('#don').checked ? '1' : '0', discount_presets: ps.join(',') });
+    state.me = await api('GET', '/api/me'); toast('打折设置已保存');
+  });
   $('#ssave').onclick = () => act(async () => {
     const faces = $('#sf').value.split(/[,，\s]+/).map(toCents).filter((n) => n > 0).join(',');
     await api('POST', '/api/settings', { shop_name: $('#sn').value.trim() || '桃喜团子', ticket_faces: faces, query_url: $('#sq').value.trim() });

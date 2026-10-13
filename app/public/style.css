@@ -143,3 +143,10 @@ tr.void td{color:var(--muted);text-decoration:line-through}
 @media (prefers-reduced-motion: reduce){*{transition:none!important}.prod:active{transform:none}}
 #sbody,#pbody,#rbody,#cbody,#ostats{display:grid;gap:16px}
 .lastorder{display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;background:var(--soft);border-radius:10px;padding:8px 10px;font-size:13px}
+.ttools{display:flex;gap:6px;justify-content:flex-end;flex-wrap:wrap}
+.disc{display:grid;gap:6px}
+.discbtns{display:flex;gap:6px;flex-wrap:wrap}
+.discbtns button{flex:1;min-width:56px;min-height:40px;border:1px solid var(--line);background:var(--paper);border-radius:10px;cursor:pointer;font-weight:600}
+.discbtns button.on{background:var(--accent);border-color:var(--accent);color:var(--on-accent)}
+.discall{display:flex;align-items:center;gap:6px;font-size:13px;color:var(--muted);cursor:pointer}
+.discall input{width:18px;min-height:18px}
