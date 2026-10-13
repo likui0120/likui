@@ -68,3 +68,12 @@ CREATE TABLE IF NOT EXISTS logs (
   id INTEGER PRIMARY KEY, created_at TEXT NOT NULL, user_id INTEGER, user_name TEXT, action TEXT NOT NULL, detail TEXT
 );
 CREATE TABLE IF NOT EXISTS sessions (token TEXT PRIMARY KEY, user_id INTEGER NOT NULL, created_at TEXT NOT NULL);
+-- 产品配方（BOM）：每做 1 个商品要用多少原料/包材（按库存品的主单位）
+CREATE TABLE IF NOT EXISTS bom (
+  product_id INTEGER NOT NULL REFERENCES products(id), item_id INTEGER NOT NULL REFERENCES stock_items(id), qty REAL NOT NULL,
+  PRIMARY KEY (product_id, item_id)
+);
+-- 成品盘点调整：理论库存 = 出炉 − 售出 − 报损 + 调整
+CREATE TABLE IF NOT EXISTS product_adj (
+  id INTEGER PRIMARY KEY, product_id INTEGER NOT NULL REFERENCES products(id), created_at TEXT NOT NULL, qty INTEGER NOT NULL, note TEXT, operator_name TEXT
+);

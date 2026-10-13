@@ -1,6 +1,6 @@
 {
   "name": "bakery-pos",
-  "version": "1.1.2",
+  "version": "1.4.0",
   "description": "桃喜团子收银系统（本地版）",
   "private": true,
   "main": "server.js",
