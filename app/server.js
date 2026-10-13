@@ -183,7 +183,33 @@ function currentUser(req) {
 // 顾客查询限流：同一来源连续输错 5 次锁 15 分钟；全店每分钟最多 60 次查询
 const lookupFails = new Map();
 let lookupWindow = { start: Date.now(), count: 0 };
-function clientIp(req) { return req.socket.remoteAddress || 'unknown'; }
+// 走内网穿透（cpolar 等）时，请求都从本机转进来，真实来源在 X-Forwarded-For 最后一项（穿透程序加的）
+function clientIp(req) {
+  const ra = req.socket.remoteAddress || 'unknown';
+  const xff = req.headers['x-forwarded-for'];
+  if (xff && /^(127\.|::1$|::ffff:127\.)/.test(ra)) return String(xff).split(',').pop().trim() || ra;
+  return ra;
+}
+// 是不是从外网来的：经内网穿透转进来的，或者来源不是局域网地址
+function fromOutside(req) {
+  const ra = (req.socket.remoteAddress || '').replace(/^::ffff:/, '');
+  if (/^(127\.|::1$)/.test(ra)) return !!req.headers['x-forwarded-for'];
+  return !/^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|169\.254\.|fe80:|f[cd])/i.test(ra);
+}
+// 外网查询码输错的总次数：每小时最多 30 次，超过就暂停外网查询，防止有人换着地址把 5 位码挨个试一遍
+let outsideLookup = { start: Date.now(), fails: 0 };
+// 登录限流：同一来源连续输错 5 次锁 15 分钟；同一个人被输错 10 次也锁 15 分钟（防外网猜密码）
+const loginFails = new Map();
+function loginLocked(key, t) {
+  const f = loginFails.get(key);
+  return f && f.until > t ? Math.ceil((f.until - t) / 60000) : 0;
+}
+function loginFail(key, limit, t) {
+  const f = loginFails.get(key);
+  const fails = (f && f.until <= t && f.fails < limit ? f.fails : 0) + 1;
+  loginFails.set(key, { fails, until: fails >= limit ? t + 15 * 60000 : 0 });
+  return limit - fails;
+}
 
 // ---------- 路由 ----------
 const routes = [];
@@ -199,9 +225,20 @@ const ANY = ['owner', 'cashier', 'kitchen'];
 
 // 登录
 route('GET', '/api/login-names', null, () => all(`SELECT name FROM users WHERE active=1 ORDER BY id`).map((r) => r.name));
-route('POST', '/api/login', null, ({ body, res }) => {
-  const u = get(`SELECT * FROM users WHERE name=? AND active=1`, String(body.name || ''));
-  if (!u || !checkPin(body.pin || '', u.pin_hash)) throw new HttpError(401, '姓名或密码不对');
+route('POST', '/api/login', null, ({ req, body, res }) => {
+  const t = Date.now();
+  const name = String(body.name || '');
+  const ipKey = 'ip:' + clientIp(req), nameKey = 'name:' + name;
+  const wait = Math.max(loginLocked(ipKey, t), loginLocked(nameKey, t));
+  if (wait) throw new HttpError(429, `密码输错次数太多，请 ${wait} 分钟后再试`);
+  const u = get(`SELECT * FROM users WHERE name=? AND active=1`, name);
+  if (!u || !checkPin(body.pin || '', u.pin_hash)) {
+    const left = Math.min(loginFail(ipKey, 5, t), u ? loginFail(nameKey, 10, t) : 99);
+    if (left <= 0) throw new HttpError(429, '密码输错次数太多，请 15 分钟后再试');
+    throw new HttpError(401, left <= 3 ? `姓名或密码不对，还可以试 ${left} 次` : '姓名或密码不对');
+  }
+  loginFails.delete(ipKey); loginFails.delete(nameKey);
+  if (fromOutside(req) && checkPin('123456', u.pin_hash)) throw new HttpError(403, '外网登录前，请先在店里电脑上把默认密码 123456 改掉');
   const token = crypto.randomBytes(24).toString('hex');
   run(`INSERT INTO sessions (token, user_id, created_at) VALUES (?,?,?)`, token, u.id, now());
   res.setHeader('Set-Cookie', `sid=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${60 * 60 * 24 * 30}`);
@@ -550,11 +587,15 @@ route('POST', '/api/public/lookup', null, ({ req, body }) => {
   const t = Date.now();
   if (t - lookupWindow.start > 60000) lookupWindow = { start: t, count: 0 };
   if (++lookupWindow.count > 60) throw new HttpError(429, '查询太频繁，请稍后再试');
+  const outside = fromOutside(req);
+  if (t - outsideLookup.start > 3600000) outsideLookup = { start: t, fails: 0 };
+  if (outside && outsideLookup.fails >= 30) throw new HttpError(429, '查询暂时关闭，请稍后再试，或连上店里 WiFi 查询');
   const f = lookupFails.get(ip);
   if (f && f.until > t) throw new HttpError(429, `输错次数太多，请 ${Math.ceil((f.until - t) / 60000)} 分钟后再试`);
   const code = String(body.code || '');
   const a = /^\d{5}$/.test(code) ? get(`SELECT * FROM accounts WHERE code=?`, code) : null;
   if (!a) {
+    if (outside) outsideLookup.fails++;
     const fails = (f && f.until === 0 ? f.fails : 0) + 1;
     lookupFails.set(ip, { fails, until: fails >= 5 ? t + 15 * 60000 : 0 });
     throw new HttpError(404, fails >= 5 ? '输错次数太多，请 15 分钟后再试' : `查询码不对，还可以试 ${5 - fails} 次`);
@@ -1300,6 +1341,13 @@ function openBrowser(url) {
     child.unref();
   } catch { /* 打不开就算了，窗口里有地址 */ }
 }
+// 「允许手机连接.bat」会加一条叫 TaoxiPOS 的防火墙规则；没加过就在窗口里提示
+function firewallOk() {
+  try {
+    require('node:child_process').execFileSync('netsh', ['advfirewall', 'firewall', 'show', 'rule', 'name=TaoxiPOS'], { stdio: 'ignore', timeout: 5000, windowsHide: true });
+    return true;
+  } catch { return false; }
+}
 const LOCAL_URL = `http://localhost:${PORT}`;
 server.on('error', (e) => {
   if (e.code === 'EADDRINUSE') {
@@ -1331,6 +1379,11 @@ server.listen(PORT, () => {
     console.log(`  顾客查询页：    http://${ip}:${PORT}/q`);
   }
   console.log(`  数据保存在：    ${DATA}`);
+  if (process.platform === 'win32' && !firewallOk()) {
+    console.log('');
+    console.log('  手机/平板打不开上面的地址？先确认连的是店里同一个 WiFi，');
+    console.log('  再双击收银系统文件夹里的「允许手机连接.bat」，点「是」放行一次就好（这个窗口不用关）。');
+  }
   console.log('');
   console.log('  收银期间不要关这个窗口，关掉收银系统就停了。');
   console.log('');
