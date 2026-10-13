@@ -15,6 +15,7 @@ try { ({ DatabaseSync } = require('node:sqlite')); } catch {
 const printer = require('./printer');
 
 const VERSION = require('./package.json').version;
+const scale = require('./scale');
 const DEFAULT_SHOP = '桃喜团子';
 
 const PORT = Number(process.env.PORT) || 3000;
@@ -41,6 +42,9 @@ addColumn('day_closes', 'tickets_json', 'TEXT'); // 日结时清点的店内余�
 addColumn('stock_items', 'pack_qty', 'REAL'); // 规格：每个包装有多少主单位，例如 25（kg/袋）
 addColumn('stock_items', 'pack_unit', 'TEXT'); // 包装单位，例如 袋
 addColumn('stock_moves', 'ref_log_id', 'INTEGER'); // 出炉自动扣原料时对应的出品记录
+addColumn('products', 'by_weight', 'INTEGER NOT NULL DEFAULT 0'); // 1 = 散装称重，价格是每斤/每公斤
+addColumn('products', 'weigh_unit', "TEXT NOT NULL DEFAULT 'jin'"); // jin 按斤 / kg 按公斤
+addColumn('order_items', 'weight_g', 'INTEGER'); // 称重商品的重量（克）；这一行 qty=1，price_cents=这一份的金额
 
 // ---------- 工具 ----------
 const now = () => {
@@ -89,6 +93,18 @@ function log(user, action, detail) {
 function getSetting(key, def) {
   const r = get(`SELECT value FROM settings WHERE key=?`, key);
   return r ? r.value : def;
+}
+const UNIT_G = { jin: 500, kg: 1000 };
+const UNIT_TEXT = { jin: '斤', kg: '公斤' };
+const kgText = (g) => (g / 1000).toFixed(3).replace(/0{1,2}$/, '');
+// 订单里一行商品的文字：称重的写重量，其他写数量
+const itemLabel = (i) => (i.weight_g ? `${i.name} ${kgText(i.weight_g)}kg` : `${i.name}×${i.qty}`);
+function scaleCfg() {
+  return {
+    mode: getSetting('scale_mode', 'off'), port: getSetting('scale_port', ''), baud: Number(getSetting('scale_baud', '9600')),
+    parity: getSetting('scale_parity', 'n'), bits: getSetting('scale_bits', '8'), stop: getSetting('scale_stop', '1'),
+    unit: getSetting('scale_unit', 'kg'), cmd: getSetting('scale_cmd', ''),
+  };
 }
 
 // ---------- 初始数据 ----------
@@ -259,6 +275,7 @@ route('GET', '/api/me', ANY, ({ user, req }) => {
     ticket_faces: getSetting('ticket_faces', '1000,2000').split(',').map(Number).filter((n) => n > 0),
     print: { mode: pc.mode, auto: pc.auto, paper: pc.paper },
     discount: discountCfg(),
+    scale_mode: getSetting('scale_mode', 'off'),
   };
 });
 route('POST', '/api/me/pin', ANY, ({ user, body }) => {
@@ -308,6 +325,14 @@ const SETTING_CHECK = {
   print_auto: (v) => ['off', 'all', 'stored'].includes(v) || '自动打印选项不对',
   print_footer: (v) => v.length <= 40 || '小票底部文字最多 40 个字',
   discount_on: (v) => ['0', '1'].includes(v) || '打折开关不对',
+  scale_mode: (v) => ['off', 'serial', 'sim'].includes(v) || '电子秤连接方式不对',
+  scale_port: (v) => v === '' || /^(COM\d{1,3}|\/dev\/[\w./-]+)$/i.test(v) || '串口名不对，例如 COM3',
+  scale_baud: (v) => ['1200', '2400', '4800', '9600', '19200', '38400', '57600', '115200'].includes(v) || '波特率不对',
+  scale_parity: (v) => ['n', 'e', 'o'].includes(v) || '校验位不对',
+  scale_bits: (v) => ['7', '8'].includes(v) || '数据位不对',
+  scale_stop: (v) => ['1', '2'].includes(v) || '停止位不对',
+  scale_unit: (v) => ['kg', 'g'].includes(v) || '秤的单位不对',
+  scale_cmd: (v) => v === '' || /^([0-9a-f]{2}\s*){1,16}$/i.test(v) || '查询指令要写成十六进制，例如 05 或 52 0D',
   discount_presets: (v) => (/^\d{1,2}(,\d{1,2}){2}$/.test(v) && v.split(',').every((x) => Number(x) >= 1 && Number(x) <= 99)) || '三个折扣要填 1 到 99 之间的数，例如 90,85,80',
 };
 route('POST', '/api/settings', OWNER, ({ user, body }) => {
@@ -321,8 +346,13 @@ route('POST', '/api/settings', OWNER, ({ user, body }) => {
   }
   tx(() => { for (const [k, v] of Object.entries(changes)) run(`INSERT INTO settings (key, value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, k, v); });
   log(user, '修改设置', changes);
+  if (Object.keys(changes).some((k) => k.startsWith('scale_'))) scale.configure(scaleCfg());
   return { ok: true };
 });
+
+// 电子秤
+route('GET', '/api/scale', ANY, () => scale.read());
+route('GET', '/api/scale/ports', OWNER, () => new Promise((resolve) => scale.listPorts(resolve)));
 
 // 商品
 route('GET', '/api/products', ANY, () => {
@@ -331,12 +361,16 @@ route('GET', '/api/products', ANY, () => {
     WHERE i.product_id=p.id AND o.status='done' AND substr(o.created_at,1,10) >= ?),0) AS sold_30d,
     COALESCE((SELECT SUM(i.qty) FROM order_items i JOIN orders o ON o.id=i.order_id
     WHERE i.product_id=p.id AND o.status='done' AND substr(o.created_at,1,10) = ?),0) AS sold_today,
+    COALESCE((SELECT SUM(i.weight_g) FROM order_items i JOIN orders o ON o.id=i.order_id
+    WHERE i.product_id=p.id AND o.status='done' AND substr(o.created_at,1,10) = ?),0) AS sold_today_g,
     (SELECT qty FROM plans WHERE date=? AND product_id=p.id) AS plan_today,
     COALESCE((SELECT SUM(qty) FROM production_logs WHERE date=? AND product_id=p.id AND type='output'),0) AS output_today
-    FROM products p ORDER BY active DESC, sort, id`, addDays(t, -29), t, t, t);
+    FROM products p ORDER BY active DESC, sort, id`, addDays(t, -29), t, t, t, t);
   const fs_ = finishedStock();
   // 剩余待做 = 今天的生产计划 − 今天已出炉
-  return rows.map((p) => ({ ...p, stock: fs_[p.id] ?? null, todo: p.plan_today === null ? null : Math.max(0, p.plan_today - p.output_today) }));
+  // 散装称重的按重量卖，不按个数算库存和待做
+  return rows.map((p) => (p.by_weight ? { ...p, stock: null, todo: null }
+    : { ...p, stock: fs_[p.id] ?? null, todo: p.plan_today === null ? null : Math.max(0, p.plan_today - p.output_today) }));
 });
 route('POST', '/api/products', OWNER, ({ user, body }) => {
   const name = String(body.name || '').trim();
@@ -344,12 +378,14 @@ route('POST', '/api/products', OWNER, ({ user, body }) => {
   if (!isInt(body.price_cents) || body.price_cents < 0) bad('价格不对');
   const cat = String(body.category || '其他').trim() || '其他';
   const sort = isInt(body.sort) ? body.sort : 0;
+  const byW = body.by_weight ? 1 : 0;
+  const wu = UNIT_G[body.weigh_unit] ? body.weigh_unit : 'jin';
   if (body.id) {
-    run(`UPDATE products SET name=?, category=?, price_cents=?, active=?, sort=? WHERE id=?`, name, cat, body.price_cents, body.active ? 1 : 0, sort, body.id);
+    run(`UPDATE products SET name=?, category=?, price_cents=?, active=?, sort=?, by_weight=?, weigh_unit=? WHERE id=?`, name, cat, body.price_cents, body.active ? 1 : 0, sort, byW, wu, body.id);
     log(user, '修改商品', { id: body.id, name, price_cents: body.price_cents, active: !!body.active });
     return { id: body.id };
   }
-  const r = run(`INSERT INTO products (name, category, price_cents, active, sort) VALUES (?,?,?,1,?)`, name, cat, body.price_cents, sort);
+  const r = run(`INSERT INTO products (name, category, price_cents, active, sort, by_weight, weigh_unit) VALUES (?,?,?,1,?,?,?)`, name, cat, body.price_cents, sort, byW, wu);
   log(user, '新增商品', { name, price_cents: body.price_cents });
   return { id: Number(r.lastInsertRowid) };
 });
@@ -363,6 +399,11 @@ route('POST', '/api/orders', STAFF, ({ user, body }) => {
     if (it.product_id) {
       const p = get(`SELECT * FROM products WHERE id=?`, it.product_id);
       if (!p) bad('商品不存在');
+      if (p.by_weight) {
+        // 称重：按商品单价和重量算这一份的金额，四舍五入到分
+        if (!isInt(it.weight_g) || it.weight_g <= 0 || it.weight_g > 100000) bad(`${p.name} 的重量不对`);
+        return { product_id: p.id, name: p.name, qty: 1, weight_g: it.weight_g, price_cents: Math.round(p.price_cents * it.weight_g / UNIT_G[p.weigh_unit || 'jin']) };
+      }
       const price = isInt(it.price_cents) && it.price_cents >= 0 ? it.price_cents : p.price_cents;
       return { product_id: p.id, name: p.name, qty: it.qty, price_cents: price };
     }
@@ -420,7 +461,7 @@ route('POST', '/api/orders', STAFF, ({ user, body }) => {
     const o = run(`INSERT INTO orders (created_at, cashier_id, cashier_name, total_cents, overpay_cents, status, photo, note, subtotal_cents, discount_pct, discount_cents) VALUES (?,?,?,?,?, 'done', ?, ?, ?, ?, ?)`,
       now(), user.id, user.name, total, over, photo, String(body.note || ''), subtotal, pct, discount);
     const oid = Number(o.lastInsertRowid);
-    for (const l of lines) run(`INSERT INTO order_items (order_id, product_id, name, qty, price_cents) VALUES (?,?,?,?,?)`, oid, l.product_id, l.name, l.qty, l.price_cents);
+    for (const l of lines) run(`INSERT INTO order_items (order_id, product_id, name, qty, price_cents, weight_g) VALUES (?,?,?,?,?,?)`, oid, l.product_id, l.name, l.qty, l.price_cents, l.weight_g || null);
     for (const p of norm) {
       run(`INSERT INTO payments (order_id, method, amount_cents, account_id, detail) VALUES (?,?,?,?,?)`,
         oid, p.method, p.amount_cents, p.account_id || null, p.tickets ? JSON.stringify(p.tickets) : null);
@@ -501,7 +542,7 @@ function accountTxs(id) {
   const txs = all(`SELECT * FROM account_tx WHERE account_id=? ORDER BY id DESC LIMIT 500`, id);
   const oids = [...new Set(txs.filter((t) => t.order_id).map((t) => t.order_id))];
   const items = oids.length ? all(`SELECT order_id, name, qty FROM order_items WHERE order_id IN (${oids.map(() => '?').join(',')})`, ...oids) : [];
-  for (const t of txs) if (t.order_id) t.items = items.filter((i) => i.order_id === t.order_id).map((i) => `${i.name}×${i.qty}`).join('、');
+  for (const t of txs) if (t.order_id) t.items = items.filter((i) => i.order_id === t.order_id).map(itemLabel).join('、');
   return txs;
 }
 route('GET', '/api/accounts/:id', STAFF, ({ params }) => {
@@ -709,7 +750,7 @@ route('GET', '/api/reports', OWNER, ({ query }) => {
   const from = isDate(query.from) ? query.from : addDays(to, -6);
   const W = `o.status='done' AND substr(o.created_at,1,10) BETWEEN ? AND ?`;
   const methods = all(`SELECT p.method, SUM(p.amount_cents) AS amount FROM payments p JOIN orders o ON o.id=p.order_id WHERE ${W} GROUP BY p.method`, from, to);
-  const products = all(`SELECT i.name, SUM(i.qty) AS qty, SUM(i.qty*i.price_cents) AS amount FROM order_items i JOIN orders o ON o.id=i.order_id WHERE ${W} GROUP BY i.name ORDER BY amount DESC`, from, to);
+  const products = all(`SELECT i.name, SUM(i.qty) AS qty, SUM(i.weight_g) AS weight_g, SUM(i.qty*i.price_cents) AS amount FROM order_items i JOIN orders o ON o.id=i.order_id WHERE ${W} GROUP BY i.name ORDER BY amount DESC`, from, to);
   const days = all(`SELECT substr(o.created_at,1,10) AS day, p.method, SUM(p.amount_cents) AS amount FROM payments p JOIN orders o ON o.id=p.order_id WHERE ${W} GROUP BY day, p.method ORDER BY day`, from, to);
   const hours = all(`SELECT substr(o.created_at,12,2) AS hour, COUNT(*) AS orders, SUM(o.total_cents) AS amount FROM orders o WHERE ${W} GROUP BY hour ORDER BY hour`, from, to);
   const totals = get(`SELECT COUNT(*) AS orders, COALESCE(SUM(total_cents),0) AS amount, COALESCE(SUM(overpay_cents),0) AS overpay, COALESCE(SUM(discount_cents),0) AS discount FROM orders o WHERE ${W}`, from, to);
@@ -735,7 +776,7 @@ route('GET', '/api/export', OWNER, ({ query, res }) => {
   } else if (query.type === 'orders') {
     const rows = ordersDetail(all(`SELECT * FROM orders WHERE substr(created_at,1,10) BETWEEN ? AND ? ORDER BY id`, from, to));
     body = csv(rows, [['id', '订单号'], ['created_at', '时间'], [(r) => (r.status === 'void' ? '已撤销' : '正常'), '状态'], ['cashier_name', '收银员'],
-      [(r) => r.items.map((i) => `${i.name}×${i.qty}`).join(' '), '商品'], [(r) => yuan(r.subtotal_cents ?? r.total_cents), '原价'],
+      [(r) => r.items.map(itemLabel).join(' '), '商品'], [(r) => yuan(r.subtotal_cents ?? r.total_cents), '原价'],
       [(r) => (r.discount_pct ? `${r.discount_pct / 10}折` : ''), '折扣'], [(r) => yuan(r.discount_cents || 0), '优惠'], [(r) => yuan(r.total_cents), '应收'],
       [(r) => yuan(r.payments.reduce((s, p) => s + p.amount_cents, 0)), '实收'], [(r) => yuan(r.overpay_cents || 0), '餐票溢收'],
       [(r) => r.payments.map((p) => `${METHOD[p.method]}${yuan(p.amount_cents)}`).join(' '), '收款方式']]);
@@ -1016,18 +1057,20 @@ function profitSummary(from, to) {
   const lossLogs = all(`SELECT product_id, SUM(qty) AS q FROM production_logs WHERE type='loss' AND date BETWEEN ? AND ? GROUP BY product_id`, from, to);
   const productLoss = Math.round(lossLogs.reduce((a, r) => a + r.q * (uc[r.product_id] || 0), 0));
   // 按商品：售出数量、打折后的销售额（整单折扣按金额分摊）、配方成本、毛利
-  const items = all(`SELECT i.product_id, i.name, i.qty, i.price_cents, o.total_cents, COALESCE(o.subtotal_cents, o.total_cents) AS sub, p.category
+  const items = all(`SELECT i.product_id, i.name, i.qty, i.price_cents, i.weight_g, p.weigh_unit, o.total_cents, COALESCE(o.subtotal_cents, o.total_cents) AS sub, p.category
     FROM order_items i JOIN orders o ON o.id=i.order_id LEFT JOIN products p ON p.id=i.product_id WHERE ${W}`, from, to);
   const prods = new Map();
   for (const it of items) {
     const key = it.product_id ? `p${it.product_id}` : `n${it.name}`;
-    if (!prods.has(key)) prods.set(key, { name: it.name, category: it.product_id ? (it.category || '其他') : '临时商品', qty: 0, sales: 0, unit_cost: it.product_id ? uc[it.product_id] ?? null : null });
+    if (!prods.has(key)) prods.set(key, { name: it.name, category: it.product_id ? (it.category || '其他') : '临时商品', qty: 0, units: 0, weight_g: 0, sales: 0, unit_cost: it.product_id ? uc[it.product_id] ?? null : null });
     const r = prods.get(key);
     r.qty += it.qty;
+    // 称重商品的配方按每斤/每公斤填，成本按卖出的重量算
+    if (it.weight_g) { r.weight_g += it.weight_g; r.units += it.weight_g / UNIT_G[it.weigh_unit || 'jin']; } else r.units += it.qty;
     r.sales += it.sub ? it.qty * it.price_cents * it.total_cents / it.sub : 0;
   }
   const products = [...prods.values()].map((r) => {
-    const cost = r.unit_cost === null ? null : Math.round(r.unit_cost * r.qty);
+    const cost = r.unit_cost === null ? null : Math.round(r.unit_cost * r.units);
     const sales = Math.round(r.sales);
     return { ...r, sales, cost, gross: cost === null ? null : sales - cost };
   }).sort((x, y) => y.sales - x.sales);
@@ -1147,7 +1190,10 @@ function orderReceipt(id) {
   const L = receiptHead('销售小票');
   L.push({ l: `单号：${o.id}`, r: `收银：${o.cashier_name || ''}` }, { l: `时间：${o.created_at.slice(0, 16)}` }, { hr: true });
   L.push({ l: '商品', r: qtyAmt('数量', '金额') });
-  for (const i of items) L.push({ l: i.name, r: qtyAmt('×' + i.qty, money(i.qty * i.price_cents)) });
+  for (const i of items) {
+    if (i.weight_g) L.push({ l: i.name, r: qtyAmt(kgText(i.weight_g) + 'kg', money(i.price_cents)) });
+    else L.push({ l: i.name, r: qtyAmt('×' + i.qty, money(i.qty * i.price_cents)) });
+  }
   L.push({ hr: true });
   if (o.discount_cents > 0) L.push({ l: '小计', r: money(o.subtotal_cents) }, { l: `折扣（${zhe(o.discount_pct)}）`, r: '-' + money(o.discount_cents) });
   L.push({ l: '合计', r: '￥' + money(o.total_cents), b: true });
@@ -1363,6 +1409,7 @@ server.on('error', (e) => {
   process.exit(1);
 });
 server.listen(PORT, () => {
+  try { scale.configure(scaleCfg()); } catch (e) { console.error('电子秤', e.message); }
   try { backup(); } catch (e) { console.error('备份失败', e.message); }
   setInterval(() => { try { backup(); } catch (e) { console.error('备份失败', e.message); } }, 6 * 60 * 60 * 1000);
   console.log('');

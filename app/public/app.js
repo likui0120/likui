@@ -5,6 +5,11 @@ const $ = (sel, el = document) => el.querySelector(sel);
 const $$ = (sel, el = document) => [...el.querySelectorAll(sel)];
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const yuan = (c) => (Number(c || 0) / 100).toFixed(2);
+// 称重：重量显示成公斤，单价单位
+const kg = (g) => (Number(g) ? (Number(g) / 1000).toFixed(3).replace(/0{1,2}$/, '') : '0');
+const UNIT_G = { jin: 500, kg: 1000 };
+const UNIT_T = { jin: '斤', kg: '公斤' };
+const itemText = (i) => (i.weight_g ? `${i.name} ${kg(i.weight_g)}kg` : `${i.name}×${i.qty}`);
 const faceText = (c) => (c % 100 ? (c / 100).toFixed(1) : String(c / 100)); // 餐票面额：1000 → "10"
 const toCents = (v) => { const n = parseFloat(String(v).trim()); return Number.isFinite(n) ? Math.round(n * 100) : NaN; };
 const pad = (n) => String(n).padStart(2, '0');
@@ -266,7 +271,7 @@ async function renderPos(main) {
     <section>
       <div class="cats">${cats.map((c) => `<button data-cat="${esc(c)}" class="${c === state.cat ? 'on' : ''}">${esc(c)}</button>`).join('')}</div>
       <div class="prods">${prods.filter((p) => state.cat === '全部' || p.category === state.cat)
-        .map((p) => `<button class="prod" data-pid="${p.id}"><b>${esc(p.name)}</b><span class="num">¥${yuan(p.price_cents)}</span><span class="pstat" data-ps="${p.id}">${prodStat(p)}</span></button>`).join('')
+        .map((p) => `<button class="prod${p.by_weight ? ' weigh' : ''}" data-pid="${p.id}"><b>${esc(p.name)}</b><span class="num">¥${yuan(p.price_cents)}${p.by_weight ? `/${UNIT_T[p.weigh_unit] || '斤'} ⚖` : ''}</span><span class="pstat" data-ps="${p.id}">${prodStat(p)}</span></button>`).join('')
         || '<p class="muted">还没有商品，请店主在"设置"里添加。</p>'}
         <button class="prod" id="custom"><b>+ 临时商品</b><span class="muted">自定义名称价格</span></button>
       </div>
@@ -277,6 +282,7 @@ async function renderPos(main) {
   $$('[data-cat]').forEach((b) => b.onclick = () => { state.cat = b.dataset.cat; renderPos(main); });
   $$('[data-pid]').forEach((b) => b.onclick = () => {
     const p = state.products.find((x) => x.id === Number(b.dataset.pid));
+    if (p.by_weight) return weighModal(p);
     const line = state.cart.find((l) => l.product_id === p.id);
     if (line) line.qty++; else state.cart.push({ product_id: p.id, name: p.name, price_cents: p.price_cents, qty: 1 });
     drawCart();
@@ -295,8 +301,48 @@ async function renderPos(main) {
   };
   drawCart();
 }
+// 称重弹窗：实时读秤，稳定后加入本单；没有秤或秤读不到时可以手动输入重量
+function weighModal(p) {
+  const unitG = UNIT_G[p.weigh_unit] || 500, unitT = UNIT_T[p.weigh_unit] || '斤';
+  const hasScale = state.me.scale_mode && state.me.scale_mode !== 'off';
+  let tare = 0, cur = null, timer = null, busy = false;
+  const m = modal(`<h3>${esc(p.name)}　<span class="num muted">¥${yuan(p.price_cents)}/${unitT}</span></h3>
+    ${hasScale ? `<div class="weigh-box"><div class="num weigh-v" id="wv">—</div><div id="ws" class="muted">正在读秤…</div></div>
+      <div class="row"><button class="btn" id="wtare">去皮（扣掉盘子/袋子）</button><span class="muted" id="wt"></span></div>` : '<p class="muted">还没有连接电子秤（店主可以在"设置 → 电子秤"里设置），请手动输入重量。</p>'}
+    <label class="f"><span>${hasScale ? '手动输入重量（克，读不到秤时用）' : '重量（克）'}</span><input id="wm" inputmode="decimal" placeholder="例如 326"></label>
+    <div class="total"><span id="wd" class="muted"></span><span class="num" id="wa">¥0.00</span></div>
+    <div class="acts"><button class="btn" data-close>取消</button><button class="btn primary" id="wok" disabled>加入本单</button></div>`, { onClose: () => clearInterval(timer) });
+  const manual = () => { const v = parseFloat($('#wm', m.el).value); return Number.isFinite(v) && v > 0 ? Math.round(v) : null; };
+  const net = () => manual() ?? (cur && cur.ok && cur.weight_g !== null ? cur.weight_g - tare : null);
+  const draw = () => {
+    const g = net();
+    const ok = g > 0 && (manual() !== null || (cur && cur.stable));
+    $('#wa', m.el).textContent = '¥' + yuan(g > 0 ? Math.round(p.price_cents * g / unitG) : 0);
+    $('#wd', m.el).textContent = g > 0 ? `${kg(g)}kg = ${(g / unitG).toFixed(2)}${unitT}` : '';
+    $('#wok', m.el).disabled = !ok;
+    if (!hasScale) return;
+    $('#wv', m.el).textContent = cur && cur.ok && cur.weight_g !== null ? `${kg(cur.weight_g - tare)} kg` : '—';
+    $('#ws', m.el).innerHTML = !cur ? '正在读秤…' : !cur.ok ? `<span class="warn">${esc(cur.error || '读不到秤')}</span>` : cur.over ? '<span class="warn">超出量程</span>'
+      : cur.stable ? '<span class="ok">● 已稳定</span>' : '<span class="muted">○ 等待稳定…</span>';
+    $('#wt', m.el).textContent = tare ? `已去皮 ${tare} 克` : '';
+  };
+  $('#wm', m.el).oninput = draw;
+  $('#wm', m.el).onkeydown = (e) => { if (e.key === 'Enter' && !$('#wok', m.el).disabled) $('#wok', m.el).click(); };
+  if (hasScale) {
+    const poll = async () => { if (busy) return; busy = true; try { cur = await api('GET', '/api/scale'); } catch { cur = null; } busy = false; draw(); };
+    poll(); timer = setInterval(poll, 300);
+    $('#wtare', m.el).onclick = () => { tare = tare ? 0 : (cur && cur.ok ? cur.weight_g : 0); $('#wtare', m.el).textContent = tare ? '取消去皮' : '去皮（扣掉盘子/袋子）'; draw(); };
+  }
+  $('#wok', m.el).onclick = () => {
+    const g = net(); if (!(g > 0)) return;
+    state.cart.push({ product_id: p.id, name: p.name, price_cents: Math.round(p.price_cents * g / unitG), qty: 1, weight_g: g });
+    m.close(); drawCart();
+  };
+  draw();
+}
 // 商品卡片上的小字：今日已售 / 目前库存 / 剩余待做
 function prodStat(p) {
+  if (p.by_weight) return `今日售 <b>${kg(p.sold_today_g)}</b>kg · ${p.sold_today} 份`;
   const st = p.stock === null ? '—' : `<b class="${p.stock <= 0 ? 'warn' : ''}">${p.stock}</b>`;
   return `售 <b>${p.sold_today}</b> · 存 ${st} · 待做 ${p.todo === null ? '—' : `<b>${p.todo}</b>`}`;
 }
@@ -335,8 +381,9 @@ function drawCart() {
     ${lo ? `<div class="lastorder"><span>上一单 #${lo.id} 已收 <b class="num">¥${yuan(lo.paid_cents)}</b>${lo.overpay_cents ? `<span class="muted">（含溢收 ¥${yuan(lo.overpay_cents)}）</span>` : ''}</span>${canPrint() ? '<button class="btn small" id="printlast">打印小票</button>' : ''}</div>` : ''}
     <div class="row between"><h3>本单</h3>${state.cart.length ? '<button class="btn small" id="clear">清空</button>' : ''}</div>
     <div class="cart-lines">${state.cart.map((l, i) => `<div class="cline">
-      <span>${esc(l.name)}<br><span class="muted num">¥${yuan(l.price_cents)}</span></span>
-      <span class="qty"><button data-dec="${i}" aria-label="减少">−</button><span class="num">${l.qty}</span><button data-inc="${i}" aria-label="增加">+</button></span>
+      <span>${esc(l.name)}<br><span class="muted num">${l.weight_g ? `${kg(l.weight_g)}kg` : `¥${yuan(l.price_cents)}`}</span></span>
+      ${l.weight_g ? `<span class="qty"><button data-dec="${i}" aria-label="删除">×</button><span class="muted" style="font-size:12px">称重</span></span>`
+        : `<span class="qty"><button data-dec="${i}" aria-label="减少">−</button><span class="num">${l.qty}</span><button data-inc="${i}" aria-label="增加">+</button></span>`}
       <span class="num">${yuan(l.qty * l.price_cents)}</span></div>`).join('') || '<p class="muted">点左边的商品加入</p>'}</div>
     <div class="row">
       <label class="btn small" style="display:inline-flex;align-items:center;gap:6px;cursor:pointer">📷 ${state.photo ? '换照片' : '拍照'}<input type="file" accept="image/*" capture="environment" id="photo" hidden></label>
@@ -390,7 +437,7 @@ function drawCart() {
 async function submitOrder(payments, m) {
   return act(async () => {
     const r = await api('POST', '/api/orders', {
-      items: state.cart.map((l) => ({ product_id: l.product_id, name: l.name, price_cents: l.price_cents, qty: l.qty })),
+      items: state.cart.map((l) => ({ product_id: l.product_id, name: l.name, price_cents: l.price_cents, qty: l.qty, weight_g: l.weight_g })),
       payments, photo: state.photo, discount_pct: state.discount || null,
     });
     m && m.close();
@@ -613,7 +660,7 @@ async function renderOrders(main) {
     $('#owrap').innerHTML = '<div class="card tbl" id="olist"></div>';
     $('#olist').innerHTML = `<table><thead><tr><th>时间</th><th>商品</th><th class="r">金额</th><th>收款</th><th>照片</th><th>收银员</th>${actions ? '<th></th>' : ''}</tr></thead><tbody>
       ${rows.map((o) => `<tr class="${o.status === 'void' ? 'void' : ''}"><td class="muted">${esc(o.created_at.slice(11, 16))}</td>
-        <td>${o.items.map((i) => `${esc(i.name)}×${i.qty}`).join('、')}${o.status === 'void' ? `<br><span class="pill bad">已撤销：${esc(o.void_reason)}</span>` : ''}</td>
+        <td>${o.items.map((i) => esc(itemText(i))).join('、')}${o.status === 'void' ? `<br><span class="pill bad">已撤销：${esc(o.void_reason)}</span>` : ''}</td>
         <td class="r num">${yuan(o.total_cents)}${o.discount_cents ? `<br><span class="pill">${zhe(o.discount_pct)} −${yuan(o.discount_cents)}</span>` : ''}</td>
         <td>${o.payments.map((p) => `<span class="pill m-${p.method}">${p.detail === '餐票找零' ? '找零' : METHOD[p.method]} ${yuan(p.amount_cents)}${p.account_name ? ' · ' + esc(p.account_name) : ''}</span>`).join(' ')}${o.overpay_cents ? ` <span class="pill">溢收 ${yuan(o.overpay_cents)}</span>` : ''}</td>
         <td>${o.photo ? `<img class="thumb sm" src="/photos/${esc(o.photo)}" alt="照片">` : ''}</td><td class="muted">${esc(o.cashier_name)}</td>
@@ -1077,7 +1124,7 @@ async function renderReports(main) {
         </tbody></table>
         <p class="muted" style="font-size:13px;margin:0">分类和商品按售出数量算成本（售出 × 单个配方成本），销售额已扣除打折。上面的"赚了"按出炉算成本，剩下没卖掉、报损的也算进去，所以两者会有差别。${P.overpay ? `餐票溢收 ¥${yuan(P.overpay)} 算在营业收入里，不分到商品。` : ''}${P.count_loss ? `盘点盘亏 ¥${yuan(P.count_loss)} 没有算进成本，可以对照看。` : ''}</p></div>
       <div class="card tbl"><h3>商品利润</h3><table><thead><tr><th>商品</th><th>分类</th><th class="r">售出</th><th class="r">销售额</th><th class="r">单个成本</th><th class="r">成本</th><th class="r">毛利</th><th class="r">毛利率</th></tr></thead><tbody>
-        ${P.products.map((x) => `<tr><td>${esc(x.name)}</td><td>${esc(x.category)}</td><td class="r num">${x.qty}</td><td class="r num">${yuan(x.sales)}</td><td class="r num">${x.unit_cost === null ? '<span class="muted">未设</span>' : yuan(x.unit_cost)}</td>
+        ${P.products.map((x) => `<tr><td>${esc(x.name)}</td><td>${esc(x.category)}</td><td class="r num">${x.weight_g ? `${kg(x.weight_g)}kg` : x.qty}</td><td class="r num">${yuan(x.sales)}</td><td class="r num">${x.unit_cost === null ? '<span class="muted">未设</span>' : yuan(x.unit_cost)}</td>
           <td class="r num">${x.cost === null ? '—' : yuan(x.cost)}</td><td class="r num">${x.gross === null ? '—' : `<b>${yuan(x.gross)}</b>`}</td><td class="r num">${x.gross === null ? '—' : pct(x.gross, x.sales)}</td></tr>`).join('') || '<tr><td colspan="8" class="empty">没有数据</td></tr>'}
         </tbody></table></div>
       <div class="stats"><div class="stat"><span class="k">四种来源合计 · ${r.totals.orders} 单</span><span class="v">¥${yuan(Object.values(by).reduce((a, b) => a + b, 0))}</span></div>
@@ -1087,7 +1134,7 @@ async function renderReports(main) {
         ${Object.entries(days).map(([d, v]) => `<tr><td>${d}</td>${Object.keys(METHOD).map((k) => `<td class="r num">${yuan(v[k])}</td>`).join('')}<td class="r num"><b>${yuan(Object.values(v).reduce((a, b) => a + b, 0))}</b></td></tr>`).join('') || '<tr><td colspan="6" class="empty">没有数据</td></tr>'}
       </tbody></table></div>
       <div class="card tbl"><h3>商品销量</h3><table><thead><tr><th>商品</th><th class="r">售出</th><th class="r">金额</th><th class="r">出炉</th><th class="r">报损</th></tr></thead><tbody>
-        ${r.products.map((p) => `<tr><td>${esc(p.name)}</td><td class="r num">${p.qty}</td><td class="r num">${yuan(p.amount)}</td><td class="r num muted">${prodMap[p.name] ? prodMap[p.name].output : '—'}</td><td class="r num muted">${prodMap[p.name] ? prodMap[p.name].loss : '—'}</td></tr>`).join('') || '<tr><td colspan="5" class="empty">没有数据</td></tr>'}
+        ${r.products.map((p) => `<tr><td>${esc(p.name)}</td><td class="r num">${p.weight_g ? `${kg(p.weight_g)}kg` : p.qty}</td><td class="r num">${yuan(p.amount)}</td><td class="r num muted">${prodMap[p.name] ? prodMap[p.name].output : '—'}</td><td class="r num muted">${prodMap[p.name] ? prodMap[p.name].loss : '—'}</td></tr>`).join('') || '<tr><td colspan="5" class="empty">没有数据</td></tr>'}
       </tbody></table><p class="muted" style="font-size:13px">出炉、报损来自出品页登记，仅作对照。</p></div>
       <div class="card tbl"><h3>时段分布</h3><table class="hidden"><thead><tr><th>时段</th><th class="r">单数</th><th class="r">金额</th></tr></thead><tbody>${r.hours.map((h) => `<tr><td>${h.hour}点</td><td>${h.orders}</td><td>${yuan(h.amount)}</td></tr>`).join('')}</tbody></table>${r.hours.map((h) => `<div class="row" style="flex-wrap:nowrap"><span class="num" style="width:48px">${h.hour}点</span><div class="bar" style="flex:1"><i style="width:${h.amount / maxH * 100}%;background:var(--accent)"></i></div><span class="num muted" style="width:120px;text-align:right">${h.orders}单 ¥${yuan(h.amount)}</span></div>`).join('') || '<p class="muted">没有数据</p>'}</div>`;
     tableTools($('#rbody'), '报表', `${f} 至 ${t}`);
@@ -1130,9 +1177,21 @@ async function renderSettings(main) {
       </div>
       <p class="muted" id="phelp" style="font-size:13px;max-width:70ch"></p>
       <div class="row"><button class="btn primary" id="psave">保存</button><button class="btn" id="ptest" data-pm="network local browser">保存并测试打印</button></div></div>
+    <div class="card"><h3>电子秤</h3>
+      <div class="grid2">
+        <label class="f"><span>连接方式</span><select id="scm"><option value="off">不用电子秤</option><option value="serial">串口秤（RS232 或 USB 连电脑）</option><option value="sim">模拟秤（没有秤时试用）</option></select></label>
+        <label class="f" data-sc="serial"><span>串口</span><div class="row" style="flex-wrap:nowrap"><input id="scp" value="${esc(settings.scale_port || '')}" placeholder="例如 COM3"><button class="btn small" id="scfind" type="button">查找</button></div></label>
+        <label class="f" data-sc="serial"><span>波特率</span><select id="scb">${['1200', '2400', '4800', '9600', '19200', '38400', '57600', '115200'].map((v) => `<option>${v}</option>`).join('')}</select></label>
+        <label class="f" data-sc="serial"><span>校验位 / 数据位 / 停止位</span><div class="row" style="flex-wrap:nowrap"><select id="scpar"><option value="n">无</option><option value="e">偶</option><option value="o">奇</option></select><select id="scbits"><option>8</option><option>7</option></select><select id="scstop"><option>1</option><option>2</option></select></div></label>
+        <label class="f" data-sc="serial"><span>秤发的数字没有单位时按</span><select id="scu"><option value="kg">公斤（例如 0.326）</option><option value="g">克（例如 326）</option></select></label>
+        <label class="f" data-sc="serial"><span>查询指令（一般不用填）</span><input id="scc" value="${esc(settings.scale_cmd || '')}" placeholder="秤要先问才回答时填，例如 05"></label>
+      </div>
+      <div class="weigh-box" data-sc="serial sim"><div class="num weigh-v" id="scv">—</div><div class="muted" id="scs" style="font-size:13px"></div></div>
+      <p class="muted" style="font-size:13px;max-width:70ch">秤要设成"连续发送"。不知道参数的话先试 9600、无、8、1，看上面有没有读数；读数乱跳或没反应，查秤的说明书或问卖家"串口波特率和数据格式"。设好后在商品里把散装商品的卖法改成"散装称重"。</p>
+      <div class="row"><button class="btn primary" id="scsave">保存</button></div></div>
     <div class="card tbl"><div class="row between"><h3>商品</h3><button class="btn primary" id="padd">+ 新增商品</button></div>
       <table><thead><tr><th>排序</th><th>名称</th><th>分类</th><th class="r">售价</th><th>状态</th><th></th></tr></thead><tbody>
-      ${products.map((p) => `<tr style="${p.active ? '' : 'opacity:.5'}"><td class="num">${p.sort}</td><td>${esc(p.name)}</td><td>${esc(p.category)}</td><td class="r num">${yuan(p.price_cents)}</td><td>${p.active ? '在售' : '下架'}</td><td><button class="btn small" data-p="${p.id}">修改</button></td></tr>`).join('')}
+      ${products.map((p) => `<tr style="${p.active ? '' : 'opacity:.5'}"><td class="num">${p.sort}</td><td>${esc(p.name)}</td><td>${esc(p.category)}</td><td class="r num">${yuan(p.price_cents)}${p.by_weight ? `/${UNIT_T[p.weigh_unit] || '斤'}` : ''}</td><td>${p.active ? '在售' : '下架'}</td><td><button class="btn small" data-p="${p.id}">修改</button></td></tr>`).join('')}
       </tbody></table></div>
     <div class="card tbl"><h3>产品配方（BOM）</h3>
       <p class="muted" style="font-size:13px;margin:0">设置每做 1 个商品要用多少原料和包材（按库存品的主单位）。设好后：出炉时自动扣库存，生产计划页能算原材料订购计划，报表能算成本和利润。</p>
@@ -1189,16 +1248,47 @@ async function renderSettings(main) {
   };
   $('#psave').onclick = () => act(async () => { await savePrinter(); toast('打印机设置已保存'); });
   $('#ptest').onclick = () => act(async () => { await savePrinter(); await printReceipt('test'); });
+  // 电子秤
+  $('#scm').value = settings.scale_mode || 'off';
+  $('#scb').value = settings.scale_baud || '9600';
+  $('#scpar').value = settings.scale_parity || 'n'; $('#scbits').value = settings.scale_bits || '8'; $('#scstop').value = settings.scale_stop || '1';
+  $('#scu').value = settings.scale_unit || 'kg';
+  const scShow = () => { const v = $('#scm').value; $$('[data-sc]').forEach((el) => el.classList.toggle('hidden', !el.dataset.sc.split(' ').includes(v))); };
+  $('#scm').onchange = scShow; scShow();
+  let scSaved = settings.scale_mode || 'off';
+  const scTimer = setInterval(async () => {
+    if (!document.body.contains($('#scv'))) return clearInterval(scTimer);
+    if (scSaved === 'off') return;
+    const r = await api('GET', '/api/scale').catch(() => null);
+    if (!r || !$('#scv')) return;
+    $('#scv').textContent = r.ok && r.weight_g !== null ? `${kg(r.weight_g)} kg` : '—';
+    $('#scs').textContent = r.ok ? `${r.stable ? '● 已稳定' : '○ 不稳定'}　秤发来的原始数据：${r.raw}` : (r.error || '');
+  }, 400);
+  $('#scfind').onclick = () => act(async () => {
+    const ports = await api('GET', '/api/scale/ports');
+    if (!ports.length) return toast('没找到串口：检查秤的线插好没有、USB 转串口驱动装了没有', true);
+    if (ports.length === 1) { $('#scp').value = ports[0]; return toast(`找到 ${ports[0]}`); }
+    toast(`找到 ${ports.join('、')}，一般是最后插上的那个`); $('#scp').value = ports[ports.length - 1];
+  });
+  $('#scsave').onclick = () => act(async () => {
+    await api('POST', '/api/settings', { scale_mode: $('#scm').value, scale_port: ((v) => (/^com/i.test(v) ? v.toUpperCase() : v))($('#scp').value.trim()), scale_baud: $('#scb').value, scale_parity: $('#scpar').value, scale_bits: $('#scbits').value, scale_stop: $('#scstop').value, scale_unit: $('#scu').value, scale_cmd: $('#scc').value.trim() });
+    scSaved = $('#scm').value; state.me = await api('GET', '/api/me'); toast('电子秤设置已保存');
+  });
   const pForm = (p = { active: 1, sort: products.length }) => {
     const m = modal(`<h3>${p.id ? '修改' : '新增'}商品</h3><div class="grid2">
       <label class="f"><span>名称</span><input id="n" value="${esc(p.name || '')}"></label>
       <label class="f"><span>分类</span><input id="c" value="${esc(p.category || '')}" placeholder="面包、蛋糕、饮品"></label>
-      <label class="f"><span>售价（元）</span><input id="pr" inputmode="decimal" value="${p.id ? yuan(p.price_cents) : ''}"></label>
+      <label class="f"><span>卖法</span><select id="bw"><option value="">按个卖</option><option value="jin" ${p.by_weight && p.weigh_unit !== 'kg' ? 'selected' : ''}>散装称重，按斤计价</option><option value="kg" ${p.by_weight && p.weigh_unit === 'kg' ? 'selected' : ''}>散装称重，按公斤计价</option></select></label>
+      <label class="f"><span id="prl">售价（元）</span><input id="pr" inputmode="decimal" value="${p.id ? yuan(p.price_cents) : ''}"></label>
       <label class="f"><span>排序（小的在前）</span><input id="s" inputmode="numeric" value="${p.sort ?? 0}"></label>
       ${p.id ? `<label class="f"><span>状态</span><select id="a"><option value="1">在售</option><option value="0" ${p.active ? '' : 'selected'}>下架</option></select></label>` : ''}</div>
+      <p class="muted" style="font-size:13px;margin:0" id="bwh"></p>
       <div class="acts"><button class="btn" data-close>取消</button><button class="btn primary" id="ok">保存</button></div>`);
+    const bwShow = () => { const v = $('#bw', m.el).value; $('#prl', m.el).textContent = v ? `单价（元/${UNIT_T[v]}）` : '售价（元）'; $('#bwh', m.el).textContent = v ? `收银时点这个商品会弹出称重窗口，按重量算钱。配方（BOM）按每${UNIT_T[v]}的用量填。散装商品不按个数算库存。` : ''; };
+    $('#bw', m.el).onchange = bwShow; bwShow();
     $('#ok', m.el).onclick = () => act(async () => {
-      await api('POST', '/api/products', { id: p.id, name: $('#n', m.el).value, category: $('#c', m.el).value, price_cents: toCents($('#pr', m.el).value), sort: parseInt($('#s', m.el).value, 10) || 0, active: p.id ? $('#a', m.el).value === '1' : true });
+      const bw = $('#bw', m.el).value;
+      await api('POST', '/api/products', { id: p.id, name: $('#n', m.el).value, category: $('#c', m.el).value, price_cents: toCents($('#pr', m.el).value), sort: parseInt($('#s', m.el).value, 10) || 0, active: p.id ? $('#a', m.el).value === '1' : true, by_weight: !!bw, weigh_unit: bw || 'jin' });
       m.close(); renderSettings(main);
     });
   };
