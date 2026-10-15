@@ -68,11 +68,16 @@ class Thresholds:
             elif r.scope == "product_stage":
                 self.pstage[(r.product_id, r.stage)] = r.value
 
+    @staticmethod
+    def _first(*vals):
+        """第一个设置过的值；0 也是有效阈值。"""
+        return next(v for v in vals if v is not None)
+
     def for_material(self, m: Material) -> Decimal:
-        return self.mat.get(m.id) or self.cat.get(m.category) or self.glob
+        return self._first(self.mat.get(m.id), self.cat.get(m.category), self.glob)
 
     def for_product(self, pid: int, stage: str) -> Decimal:
-        return self.pstage.get((pid, stage)) or self.stage.get(stage) or self.glob
+        return self._first(self.pstage.get((pid, stage)), self.stage.get(stage), self.glob)
 
 
 # ---------------------------------------------------------------- 原料结果
@@ -172,8 +177,8 @@ class DayCalc:
             r.actual = r.std = ONE
             r.source = "fixed"
         else:
-            r.std = self.mat_std.get(mid)
-            if rec is not None and rec.qty1:
+            r.std = self.mat_std.get(mid) or None  # 0 视为没设
+            if rec is not None and rec.qty1 and rec.qty2:
                 r.actual = rec.qty2 / rec.qty1
                 r.source = "actual"
                 if r.std is None:
@@ -235,13 +240,17 @@ class DayCalc:
 
     def calc_sesame_oil(self, rec: DailyProduction, p: Product) -> CalcProduct:
         std_row = self.prod_std.get(p.id)
-        std = std_row.cook_yield if std_row else None
-        actual = div(rec.output_weight, rec.qty_in)
+        std = (std_row.cook_yield or None) if std_row else None
+        actual = div(rec.output_weight, rec.qty_in) or None  # 产量为 0 时出率无意义
         sesame = self.materials.get(p.source_material_id) if p.source_material_id else None
         price1 = self.prices.get(sesame.id) if sesame else None
         if sesame:
             self.material(sesame.id).used = True
         key = f"p:{p.id}:oil"
+        if actual is None:
+            self.issue("warning", key, p.name, "芝麻用量或麻油产量为 0，无法计算麻油出率和单价", "oil")
+        if not std:
+            std = None
         if std is None and actual is not None:
             std = actual
             self.issue("warning", key, p.name, "缺麻油标准出率，标准成本按实际出率计", "oil")
@@ -277,6 +286,9 @@ class DayCalc:
         batches = rec.batches or ZERO
         if batches <= 0:
             self.issue("warning", f"p:{p.id}:cook", p.name, "锅数/机数为空或为 0，无法计算")
+            return cp
+        if not rec.output_weight:
+            self.issue("warning", f"p:{p.id}:cook", p.name, "出锅重/出机重为 0，无法计算出率和单价")
             return cp
 
         # ---- BOM 行单价
@@ -319,10 +331,13 @@ class DayCalc:
         per_batch = sum(l.qty for l in lines)
         input_weight = batches * per_batch
         cp.input_weight = input_weight
+        if per_batch <= 0:
+            self.issue("warning", f"p:{p.id}:bom", p.name, "BOM 每锅投料合计为 0，无法计算")
+            return cp
 
         # ---- 熟制 / 拌馅出率
         cook_a = div(rec.output_weight, input_weight)
-        cook_s = std_row.cook_yield if std_row and std_row.cook_yield is not None else None
+        cook_s = (std_row.cook_yield or None) if std_row else None
         if cook_s is None and cook_a is not None:
             cook_s = cook_a
             self.issue("warning", f"p:{p.id}:cook", p.name, "缺熟制/拌馅标准出率，标准成本按实际出率计", "cook")
@@ -332,7 +347,7 @@ class DayCalc:
         # ---- 制冷
         cool_a = cool_s = None
         if p.cooled:
-            cool_s = std_row.cool_yield if std_row and std_row.cool_yield is not None else None
+            cool_s = (std_row.cool_yield or None) if std_row else None
             crec = self.cooling.get(p.id)
             if crec is not None:
                 cp.cooled_weight = crec.cooled_weight
@@ -359,7 +374,7 @@ class DayCalc:
         packed = p.packed and p.ptype == "成品馅"
         prec = self.packing.get(p.id)
         if packed:
-            pack_s = std_row.pack_yield if std_row and std_row.pack_yield is not None else None
+            pack_s = (std_row.pack_yield or None) if std_row else None
             if prec is None:
                 self.issue("warning", f"p:{p.id}:pack", p.name, "缺包装记录，不出成品单价", "pack")
             else:
@@ -610,7 +625,7 @@ def recalc_from(db: Session, start: date | None = None) -> dict:
     for d in set(db.scalars(stale)) - set(dates):
         clear_day(db, d)
     out = [recalc_day(db, d) for d in dates]
-    db.commit()
+    db.flush()  # 由调用方提交，和引起重算的改动在同一个事务里
     return {"days": len(out), "from": dates[0].isoformat() if dates else None,
             "to": dates[-1].isoformat() if dates else None,
             "alerts": sum(o["alerts"] for o in out), "warnings": sum(o["warnings"] for o in out)}

@@ -31,4 +31,5 @@ def demo(db):
     init_demo(db)
     db.commit()
     recalc_from(db, None)
+    db.commit()
     return db

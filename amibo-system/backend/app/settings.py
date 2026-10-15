@@ -1,4 +1,6 @@
 """全局设置。待确认事项都做成设置项，工厂答复后改设置即可，不改程序。"""
+from decimal import Decimal, InvalidOperation
+
 from sqlalchemy.orm import Session
 
 from .models import Setting
@@ -28,9 +30,25 @@ def all_settings(db: Session) -> list[dict]:
     ]
 
 
+def check_setting(key: str, value: str) -> str:
+    """校验设置值，不合法抛 ValueError（说明原因）。"""
+    value = (value or "").strip()
+    if key in ("global_threshold", "suspect_pp"):
+        try:
+            d = Decimal(value)
+        except InvalidOperation:
+            raise ValueError(f"{DEFAULTS[key][1]}应是数字")
+        if not d.is_finite() or d < 0:
+            raise ValueError(f"{DEFAULTS[key][1]}不能是负数")
+    elif key == "sesame_rule" and value not in ("rolling7", "prev_week"):
+        raise ValueError("麻油投料单价口径只能是 rolling7 或 prev_week")
+    return value
+
+
 def set_setting(db: Session, key: str, value: str):
     if key not in DEFAULTS:
         raise KeyError(key)
+    value = check_setting(key, value)
     row = db.get(Setting, key)
     if row is None:
         db.add(Setting(key=key, value=value))

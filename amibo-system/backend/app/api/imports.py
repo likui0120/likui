@@ -17,7 +17,7 @@ from ..models import (
     MATERIAL_CATEGORIES, PRODUCT_TYPES, TEAMS, Bom, BomLine, Material, MaterialPrice, MaterialStdYield, Product,
     ProductStdYield,
 )
-from .common import commit_or_400, parse_date, recalc_after
+from .common import flush_or_400, parse_date, recalc_after
 
 router = APIRouter(prefix="/api/import")
 
@@ -197,7 +197,7 @@ def import_tplus(day: str = Form(...), unit: str = Form("jin"), file: UploadFile
         else:
             row.price, row.source = price, src
         matched.append({"material_id": mid, "name": a["m"].name, "price": str(price), "rows": a["rows"]})
-    commit_or_400(db)
+    flush_or_400(db)
     summary = recalc_after(db, d)
     return {"matched": matched, "unmatched": unmatched, "bad": bad, "recalc": summary}
 
@@ -252,7 +252,7 @@ def import_materials(effective_date: str = Form("2020-01-01"), file: UploadFile 
                 db.add(MaterialStdYield(material_id=m.id, effective_date=eff, std_yield=std))
             else:
                 sy.std_yield = std
-    commit_or_400(db)
+    flush_or_400(db)
     recalc_after(db, None)
     return {"created": created, "updated": updated, "bad": bad}
 
@@ -318,7 +318,7 @@ def import_products(effective_date: str = Form("2020-01-01"), file: UploadFile =
                 sy.cool_yield = s2
             if s3 is not None:
                 sy.pack_yield = s3
-    commit_or_400(db)
+    flush_or_400(db)
     recalc_after(db, None)
     return {"created": created, "updated": updated, "bad": bad}
 
@@ -388,7 +388,7 @@ def import_boms(effective_date: str = Form(...), file: UploadFile = File(...), d
         for l in g["lines"]:
             b.lines.append(BomLine(**l))
         imported.append({"product": p.name, "lines": len(g["lines"]), "total": str(sum(l["qty"] for l in g["lines"]))})
-    commit_or_400(db)
+    flush_or_400(db)
     recalc_after(db, eff)
     return {"imported": imported, "unmatched": unmatched}
 

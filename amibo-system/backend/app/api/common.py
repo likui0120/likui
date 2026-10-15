@@ -61,6 +61,19 @@ def parse_dec(v, label="数值"):
     return d
 
 
+def parse_bool(v, label="开关"):
+    if isinstance(v, bool) or v is None:
+        return bool(v)
+    if isinstance(v, (int, float)) and v in (0, 1):
+        return bool(v)
+    s = str(v).strip().lower()
+    if s in ("true", "1", "yes", "y", "是", "√"):
+        return True
+    if s in ("false", "0", "no", "n", "否", ""):
+        return False
+    raise HTTPException(400, f"{label} 应是“是/否”：{v}")
+
+
 def apply_payload(row, payload: dict, skip=("id",)):
     """按列类型把请求体写入行。"""
     cols = {c.key: c for c in inspect(row.__class__).columns}
@@ -73,35 +86,65 @@ def apply_payload(row, payload: dict, skip=("id",)):
         elif isinstance(t, Date):
             v = parse_date(v) if v not in (None, "") else None
         elif isinstance(t, Boolean):
-            v = bool(v)
+            v = parse_bool(v, k)
         elif isinstance(t, Integer):
-            v = int(v) if v not in (None, "") else None
+            try:
+                v = int(v) if v not in (None, "") else None
+            except (TypeError, ValueError):
+                raise HTTPException(400, f"{k} 应是整数：{v}")
         elif isinstance(v, str):
             v = v.strip() or None if cols[k].nullable else v.strip()
         setattr(row, k, v)
     return row
 
 
-def commit_or_400(db: Session):
+def integrity_400(db: Session, e: IntegrityError):
+    db.rollback()
+    msg = str(e.orig)
+    if "UNIQUE" in msg:
+        raise HTTPException(400, "已存在相同的记录（名称、编码或同一生效日期重复）")
+    if "FOREIGN KEY" in msg:
+        raise HTTPException(400, "这条资料已被其他数据引用，不能删除")
+    raise HTTPException(400, msg)
+
+
+def flush_or_400(db: Session):
+    """把改动写进当前事务（还没提交），唯一/外键冲突转成 400。"""
     try:
-        db.commit()
+        db.flush()
     except IntegrityError as e:
-        db.rollback()
-        msg = str(e.orig)
-        if "UNIQUE" in msg:
-            raise HTTPException(400, "已存在相同的记录（名称、编码或同一生效日期重复）")
-        if "FOREIGN KEY" in msg:
-            raise HTTPException(400, "这条资料已被其他数据引用，不能删除")
-        raise HTTPException(400, msg)
+        integrity_400(db, e)
 
 
 def recalc_after(db: Session, start: date | None):
-    """资料或录入变动后重算受影响的日期。"""
-    return recalc_from(db, start)
+    """资料或录入变动后重算受影响的日期，和改动一起提交。
+
+    改动和重算在同一个事务里：重算失败就整体回滚，原始资料和计算结果不会对不上。
+    """
+    try:
+        db.flush()
+        summary = recalc_from(db, start)
+        db.commit()
+    except IntegrityError as e:
+        integrity_400(db, e)
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as e:  # 计算出错：本次修改不保存
+        db.rollback()
+        raise HTTPException(400, f"计算出错，本次修改没有保存：{type(e).__name__} {e}")
+    return summary
+
+
+def commit_only(db: Session):
+    try:
+        db.commit()
+    except IntegrityError as e:
+        integrity_400(db, e)
 
 
 def crud_router(model, prefix: str, *, order_by=None, versioned: bool = False,
-                recalc: bool = True, decorate=None) -> APIRouter:
+                recalc: bool = True, decorate=None, validate=None) -> APIRouter:
     """通用增删改查。versioned=True 的表按生效日期重算，否则改动后全部重算。"""
     r = APIRouter(prefix=prefix)
 
@@ -116,12 +159,16 @@ def crud_router(model, prefix: str, *, order_by=None, versioned: bool = False,
     def after(db, row_date):
         if recalc:
             recalc_after(db, row_date if versioned else None)
+        else:
+            commit_only(db)
 
     @r.post("")
     def create(payload: dict = Body(...), db: Session = Depends(get_db)):
         row = apply_payload(model(), payload)
+        if validate:
+            validate(db, row)
         db.add(row)
-        commit_or_400(db)
+        flush_or_400(db)
         after(db, getattr(row, "effective_date", None))
         return to_dict(row)
 
@@ -132,7 +179,9 @@ def crud_router(model, prefix: str, *, order_by=None, versioned: bool = False,
             raise HTTPException(404, "记录不存在")
         old = getattr(row, "effective_date", None)
         apply_payload(row, payload)
-        commit_or_400(db)
+        if validate:
+            validate(db, row)
+        flush_or_400(db)
         new = getattr(row, "effective_date", None)
         after(db, min(d for d in (old, new) if d) if (old or new) else None)
         return to_dict(row)
@@ -144,7 +193,7 @@ def crud_router(model, prefix: str, *, order_by=None, versioned: bool = False,
             raise HTTPException(404, "记录不存在")
         d = getattr(row, "effective_date", None)
         db.delete(row)
-        commit_or_400(db)
+        flush_or_400(db)
         after(db, d)
         return {"ok": True}
 

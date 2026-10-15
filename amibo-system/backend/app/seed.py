@@ -222,6 +222,7 @@ def main():
         init_demo(db)
     db.commit()
     print(recalc_from(db, None))
+    db.commit()
     db.close()
 
 

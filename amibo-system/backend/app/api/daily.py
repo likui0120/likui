@@ -4,6 +4,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..calc.energy import prev_reading
+from ..calc.engine import Thresholds
 from ..calc.versions import effective_rows
 from ..db import get_db
 from ..models import (
@@ -11,7 +12,7 @@ from ..models import (
     Material, MaterialPrice, MaterialStdYield, Meter, MeterReading, MeterVersion, PackSpec, PackSpecVersion,
     Product, ProductStdYield,
 )
-from .common import commit_or_400, parse_date, parse_dec, recalc_after, to_dict
+from .common import flush_or_400, parse_date, parse_dec, recalc_after, to_dict
 
 router = APIRouter(prefix="/api/daily")
 
@@ -29,9 +30,11 @@ def get_day(day: str, db: Session = Depends(get_db)):
     d = parse_date(day)
     mats = list(db.scalars(select(Material).order_by(Material.category, Material.name)))
     mat_std = effective_rows(db, MaterialStdYield, "material_id", d)
+    th = Thresholds(db)  # 录入页即时标红和后端异常用同一套阈值
     proc = {r.material_id: r for r in db.scalars(select(DailyMaterialProcess).where(DailyMaterialProcess.date == d))}
     process = [{
         "material_id": m.id, "name": m.name, "code": m.code, "category": m.category,
+        "threshold": s(th.for_material(m)),
         "std_yield": s(mat_std[m.id].std_yield) if m.id in mat_std else None,
         "qty1": s(proc[m.id].qty1) if m.id in proc else None,
         "qty2": s(proc[m.id].qty2) if m.id in proc else None,
@@ -56,23 +59,26 @@ def get_day(day: str, db: Session = Depends(get_db)):
         base = {"product_id": p.id, "name": p.name, "code": p.code, "team": p.team, "ptype": p.ptype}
         if p.ptype == "麻油":
             sesame.append({**base, "qty_in": s(rec.qty_in) if rec else None,
-                           "output_weight": s(rec.output_weight) if rec else None, "std_yield": std(p.id, "cook_yield")})
+                           "output_weight": s(rec.output_weight) if rec else None, "std_yield": std(p.id, "cook_yield"),
+                           "threshold": s(th.for_product(p.id, "oil"))})
             continue
         bom = boms.get(p.id)
         production.append({**base, "per_batch": s(sum(l.qty for l in bom.lines)) if bom and bom.lines else None,
                            "has_bom": bom is not None, "std_yield": std(p.id, "cook_yield"),
+                           "threshold": s(th.for_product(p.id, "cook")),
                            "batches": s(rec.batches) if rec else None,
                            "output_weight": s(rec.output_weight) if rec else None})
         if p.cooled:
             c = cool.get(p.id)
             cooling.append({**base, "output_weight": s(rec.output_weight) if rec else None,
-                            "std_yield": std(p.id, "cool_yield"), "cooled_weight": s(c.cooled_weight) if c else None})
+                            "std_yield": std(p.id, "cool_yield"), "threshold": s(th.for_product(p.id, "cool")),
+                            "cooled_weight": s(c.cooled_weight) if c else None})
         if p.packed and p.ptype == "成品馅":
             k = pack.get(p.id)
             c = cool.get(p.id)
             default_pre = (c.cooled_weight if c else None) if p.cooled else (rec.output_weight if rec else None)
             packing.append({**base, "cooled": p.cooled, "default_prepack": s(default_pre),
-                            "std_yield": std(p.id, "pack_yield"),
+                            "std_yield": std(p.id, "pack_yield"), "threshold": s(th.for_product(p.id, "pack")),
                             "packed_weight": s(k.packed_weight) if k else None,
                             "prepack_weight": s(k.prepack_weight) if k else None,
                             "bags": {str(b.spec_id): s(b.bags) for b in k.bags} if k else {}})
@@ -127,18 +133,24 @@ def upsert(db, model, d, key_field, key, values: dict | None):
 
 
 def finish(db: Session, d):
-    commit_or_400(db)
+    flush_or_400(db)
     summary = recalc_after(db, d)
     return {"ok": True, "recalc": summary, "issues": day_issues(db, d)}
 
 
-def need(v, label, name):
+def need(v, label, name, positive=False, hint=""):
+    """必填数值。positive=True 时必须大于 0（做分母的重量，0 会让出率和单价算不出来）。"""
     x = parse_dec(v, label)
     if x is None:
         raise HTTPException(400, f"{name}：{label}不能为空")
     if x < 0:
         raise HTTPException(400, f"{name}：{label}不能是负数")
+    if positive and x == 0:
+        raise HTTPException(400, f"{name}：{label}不能为 0{hint}")
     return x
+
+
+SCRAP_HINT = "。如果当天整批报废，请清空这一行，并在异常清单里备注原因"
 
 
 @router.put("/{day}/process")
@@ -150,9 +162,8 @@ def save_process(day: str, rows: list[dict] = Body(...), db: Session = Depends(g
         if empty(r.get("qty1"), r.get("qty2")):
             upsert(db, DailyMaterialProcess, d, "material_id", mid, None)
             continue
-        q1, q2 = need(r.get("qty1"), "1 级领用量", name), need(r.get("qty2"), "2 级称重", name)
-        if q1 == 0:
-            raise HTTPException(400, f"{name}：1 级领用量不能为 0")
+        q1 = need(r.get("qty1"), "1 级领用量", name, positive=True)
+        q2 = need(r.get("qty2"), "2 级称重", name, positive=True, hint="。当天没处理就把两格都清空")
         upsert(db, DailyMaterialProcess, d, "material_id", mid, {"qty1": q1, "qty2": q2})
     return finish(db, d)
 
@@ -166,9 +177,8 @@ def save_production(day: str, rows: list[dict] = Body(...), db: Session = Depend
         if empty(r.get("batches"), r.get("output_weight")):
             upsert(db, DailyProduction, d, "product_id", pid, None)
             continue
-        b, w = need(r.get("batches"), "锅数/机数", name), need(r.get("output_weight"), "出锅重/出机重", name)
-        if b == 0:
-            raise HTTPException(400, f"{name}：锅数/机数不能为 0")
+        b = need(r.get("batches"), "锅数/机数", name, positive=True)
+        w = need(r.get("output_weight"), "出锅重/出机重", name, positive=True, hint=SCRAP_HINT)
         upsert(db, DailyProduction, d, "product_id", pid, {"batches": b, "output_weight": w, "qty_in": None})
     return finish(db, d)
 
@@ -182,9 +192,8 @@ def save_sesame(day: str, rows: list[dict] = Body(...), db: Session = Depends(ge
         if empty(r.get("qty_in"), r.get("output_weight")):
             upsert(db, DailyProduction, d, "product_id", pid, None)
             continue
-        q, w = need(r.get("qty_in"), "芝麻用量", name), need(r.get("output_weight"), "麻油产量", name)
-        if q == 0:
-            raise HTTPException(400, f"{name}：芝麻用量不能为 0")
+        q = need(r.get("qty_in"), "芝麻用量", name, positive=True)
+        w = need(r.get("output_weight"), "麻油产量", name, positive=True, hint=SCRAP_HINT)
         upsert(db, DailyProduction, d, "product_id", pid, {"qty_in": q, "output_weight": w, "batches": None})
     return finish(db, d)
 
@@ -198,7 +207,8 @@ def save_cooling(day: str, rows: list[dict] = Body(...), db: Session = Depends(g
             upsert(db, DailyCooling, d, "product_id", pid, None)
             continue
         upsert(db, DailyCooling, d, "product_id", pid,
-               {"cooled_weight": need(r["cooled_weight"], "打冷出机重", r.get("name") or pid)})
+               {"cooled_weight": need(r["cooled_weight"], "打冷出机重", r.get("name") or pid,
+                                      positive=True, hint=SCRAP_HINT)})
     return finish(db, d)
 
 
@@ -212,13 +222,16 @@ def save_packing(day: str, rows: list[dict] = Body(...), db: Session = Depends(g
         if empty(r.get("packed_weight")) and not bags:
             upsert(db, DailyPacking, d, "product_id", pid, None)
             continue
-        packed = need(r.get("packed_weight"), "包装入库量", name)
+        packed = need(r.get("packed_weight"), "包装入库量", name, positive=True, hint=SCRAP_HINT)
         pre = parse_dec(r.get("prepack_weight"), "包装前重量")
+        if pre is not None and pre <= 0:
+            raise HTTPException(400, f"{name}：包装前重量必须大于 0（留空则取上一环节产出）")
+        for n in bags.values():
+            if n < 0 or n != n.to_integral_value():
+                raise HTTPException(400, f"{name}：袋数应是不小于 0 的整数")
         row = upsert(db, DailyPacking, d, "product_id", pid, {"packed_weight": packed, "prepack_weight": pre})
         row.bags.clear()
         for spec_id, n in bags.items():
-            if n < 0:
-                raise HTTPException(400, f"{name}：袋数不能是负数")
             if n:
                 row.bags.append(DailyPackingBag(spec_id=spec_id, bags=n))
     return finish(db, d)
@@ -232,9 +245,18 @@ def save_meters(day: str, rows: list[dict] = Body(...), db: Session = Depends(ge
         if empty(r.get("reading")):
             upsert(db, MeterReading, d, "meter_id", mid, None)
             continue
+        name = r.get("name") or mid
+        reading = need(r["reading"], "本期读数", name)
+        old_final = parse_dec(r.get("old_final"), "旧表最终读数")
+        new_start = parse_dec(r.get("new_start"), "新表起始读数")
+        if old_final is not None and new_start is None:
+            raise HTTPException(400, f"{name}：换表要同时填新表起始读数")
+        if new_start is not None:
+            if new_start < 0 or (old_final is not None and old_final < 0):
+                raise HTTPException(400, f"{name}：换表读数不能是负数")
+            if reading < new_start:
+                raise HTTPException(400, f"{name}：本期读数小于新表起始读数，请核对")
         upsert(db, MeterReading, d, "meter_id", mid, {
-            "reading": parse_dec(r["reading"], "本期读数"),
-            "old_final": parse_dec(r.get("old_final"), "旧表最终读数"),
-            "new_start": parse_dec(r.get("new_start"), "新表起始读数"),
+            "reading": reading, "old_final": old_final, "new_start": new_start,
         })
     return finish(db, d)
