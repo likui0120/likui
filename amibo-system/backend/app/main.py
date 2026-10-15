@@ -1,4 +1,5 @@
 """程序入口：接口 + 前端静态页面。"""
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, Request
@@ -7,6 +8,7 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from . import backup
 from .api import daily, imports, master, reports
 from .api.common import parse_date
 from .db import Base, engine, get_db
@@ -14,11 +16,20 @@ from .models import CalcEnergy, CalcIssue, CalcProduct, Product
 
 Base.metadata.create_all(engine)
 
-app = FastAPI(title="车间出率与成本核算系统")
+
+@asynccontextmanager
+async def lifespan(_app):
+    backup.start_auto_backup()  # 启动时当天还没备份就备份一份，之后每天一份
+    yield
+    backup.stop_auto_backup()
+
+
+app = FastAPI(title="车间出率与成本核算系统", lifespan=lifespan)
 app.include_router(master.router)
 app.include_router(daily.router)
 app.include_router(imports.router)
 app.include_router(reports.router)
+app.include_router(backup.router)
 
 
 @app.exception_handler(Exception)

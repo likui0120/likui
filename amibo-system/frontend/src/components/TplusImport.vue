@@ -208,8 +208,9 @@ async function toggle(b) {
 }
 
 async function undo(b) {
-  await ElMessageBox.confirm(`把 #${b.id} 这次导入的 ${b.matched} 个单价恢复成导入前的值？导入后又手工改过的原料不会动。`, '撤销导入',
-    { confirmButtonText: '撤销', cancelButtonText: '取消', type: 'warning' })
+  const ok = await ElMessageBox.confirm(`把 #${b.id} 这次导入的 ${b.matched} 个单价恢复成导入前的值？导入后又手工改过的原料不会动。`, '撤销导入',
+    { confirmButtonText: '撤销', cancelButtonText: '取消', type: 'warning' }).catch(() => false)
+  if (!ok) return
   const r = await api.post(`/api/import/batches/${b.id}/undo`)
   done.value = null
   ElMessage.success(`已恢复 ${r.restored.length} 个单价${r.skipped.length ? `，${r.skipped.length} 个导入后改过的没动` : ''}`)
