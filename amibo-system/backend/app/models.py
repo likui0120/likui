@@ -365,6 +365,7 @@ class CalcMaterial(Base):
     # 计算当天用的属性（报表按这个归类，不随资料后来的修改变化）
     category: Mapped[str | None] = mapped_column(String(16))
     needs_process: Mapped[bool | None] = mapped_column(Boolean)
+    loss_amount: Mapped[object | None] = mapped_column(Dec)  # 2 级称重为 0（全损）时损失的原料成本（元）
 
 
 class CalcProduct(Base):
@@ -409,6 +410,7 @@ class CalcProduct(Base):
     # 数据质量：status = complete（成品/最终单价算全，全部实测）/ estimated（算出但用了标准值估算）
     #   / partial（只算到中间环节）/ loss（全损）/ none（算不出）；flags 列出原因
     quality: Mapped[dict | None] = mapped_column(JSON)
+    loss_amount: Mapped[object | None] = mapped_column(Dec)  # 全损时损失的成本（元）
 
 
 class CalcIssue(Base):

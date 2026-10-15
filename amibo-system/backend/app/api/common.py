@@ -142,7 +142,7 @@ def log_change(db: Session, table: str, row_id, action: str, old: dict | None, n
     from ..models import ChangeLog
 
     if old is not None and new is not None:
-        keys = [k for k in new if old.get(k) != new.get(k)]
+        keys = [k for k in dict.fromkeys([*old, *new]) if old.get(k) != new.get(k)]
         if not keys:
             return
         old, new = {k: old.get(k) for k in keys}, {k: new.get(k) for k in keys}
@@ -203,7 +203,8 @@ def crud_router(model, prefix: str, *, order_by=None, versioned: bool = False,
         if validate:
             validate(db, row)
         flush_or_400(db)
-        log_change(db, model.__tablename__, row_id, "update", before, to_dict(row), start)
+        if not update_hook:  # 带属性版本的修改由 hook 自己记（含版本旧值）
+            log_change(db, model.__tablename__, row_id, "update", before, to_dict(row), start)
         if recalc:
             recalc_after(db, start)
         else:

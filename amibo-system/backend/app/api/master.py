@@ -127,6 +127,8 @@ def versioned_attrs_hook(entity: str):
         correction = parse_bool(payload.pop("attr_correction", False), "是否修正历史")
         old = {f: getattr(row, f) for f in fields}
         apply_payload(row, payload)
+        # 先校验这次要写进版本的值本身（下面主资料会被换回最新一版，不能只校验主资料）
+        VALIDATORS[entity](db, row)
         new = {f: getattr(row, f) for f in fields}
         changed = {f: new[f] for f in fields if new[f] != old[f]}
         if not changed:
@@ -134,9 +136,11 @@ def versioned_attrs_hook(entity: str):
         versions = list(db.scalars(select(AttrVersion).where(
             AttrVersion.entity == entity, AttrVersion.entity_id == row.id).order_by(AttrVersion.effective_date)))
         if correction:
+            before = [{"effective_date": v.effective_date.isoformat(), "data": dict(v.data)} for v in versions]
             for v in versions:
                 v.data = {**v.data, **changed}
-            log_change(db, row.__tablename__, row.id, "update", old, new, None, "修正历史：所有日期一起改")
+            log_change(db, row.__tablename__, row.id, "update", {"base": old, "versions": before},
+                       {"base": new, "changed": changed}, None, "修正历史：所有日期一起改")
             return None
         d = parse_date(eff) if eff else date.today()
         if not versions:
@@ -175,6 +179,7 @@ def list_change_log(limit: int = 200, db: Session = Depends(get_db)):
     return [to_dict(r) for r in rows]
 
 
+VALIDATORS = {"material": v_material, "product": v_product}
 HOOKS = {Material: versioned_attrs_hook("material"), Product: versioned_attrs_hook("product")}
 
 for model, prefix, order, versioned, validate in [

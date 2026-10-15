@@ -117,31 +117,40 @@ def get_yield(start: str | None = None, end: str | None = None, all_materials: b
 
 # ---------------------------------------------------------------- 成本日报
 
-def cost_report(db: Session, st: date, e: date):
+def cost_report(db: Session, st: date, e: date, ptype: str | None = None, kw: str | None = None):
+    """ptype / kw：和页面上的筛选一致，导出时带上，导出的就是页面上看到的。"""
     prods = {p.id: p for p in db.scalars(select(Product))}
     rows = []
     for r in db.scalars(select(CalcProduct).where(CalcProduct.date >= st, CalcProduct.date <= e)
                         .order_by(CalcProduct.date, CalcProduct.product_id)):
         p = prods[r.product_id]
+        if (ptype and (r.ptype or p.ptype) != ptype) or (kw and kw not in p.name):
+            continue
         rows.append({"date": r.date.isoformat(), "product_id": p.id, "name": p.name, "ptype": r.ptype or p.ptype,
                      "team": r.team or p.team, "ok": r.ok, "input_cost": s(r.input_cost_actual),
                      "out_a": s(r.out_price_actual), "out_s": s(r.out_price_std),
                      "cooled_a": s(r.cooled_price_actual), "cooled_s": s(r.cooled_price_std),
                      "final_a": s(r.final_price_actual), "final_s": s(r.final_price_std),
                      "bag_fee": s(r.bag_fee), "weight": s(r.packed_weight or r.cooled_weight or r.output_weight),
-                     "diff_price": s(r.diff_price), "diff_amount": s(r.diff_amount)})
+                     "diff_price": s(r.diff_price), "diff_amount": s(r.diff_amount),
+                     "loss_amount": s(r.loss_amount),
+                     "quality": (r.quality or {}).get("label") or ("算出" if r.ok else "算不出"),
+                     "quality_status": (r.quality or {}).get("status"),
+                     "quality_flags": "；".join((r.quality or {}).get("flags", []))})
     cols = [("date", "日期", "text"), ("name", "产品", "text"), ("ptype", "类型", "text"), ("team", "班组", "text"),
             ("input_cost", "投料成本(元)", "money"), ("out_a", "出机单价·实际", "price"), ("out_s", "出机单价·标准", "price"),
             ("cooled_a", "冷后单价·实际", "price"), ("cooled_s", "冷后单价·标准", "price"),
             ("final_a", "成品单价·实际", "price"), ("final_s", "成品单价·标准", "price"),
             ("bag_fee", "袋费(元)", "money"), ("weight", "计价重量(斤)", "weight"),
-            ("diff_price", "差额(元/斤)", "price"), ("diff_amount", "当日差额(元)", "money")]
+            ("diff_price", "差额(元/斤)", "price"), ("diff_amount", "当日差额(元)", "money"),
+            ("quality", "数据状态", "text"), ("loss_amount", "全损损失(元)", "money"), ("quality_flags", "状态说明", "text")]
     return {"title": "成本日报", "columns": cols, "rows": rows}
 
 
 @router.get("/cost")
-def get_cost(start: str | None = None, end: str | None = None, db: Session = Depends(get_db)):
-    return cost_report(db, *rng(start, end))
+def get_cost(start: str | None = None, end: str | None = None, ptype: str | None = None, kw: str | None = None,
+             db: Session = Depends(get_db)):
+    return cost_report(db, *rng(start, end), ptype, kw)
 
 
 # ---------------------------------------------------------------- 成本链路
@@ -167,7 +176,8 @@ def trace(product_id: int, day: str, db: Session = Depends(get_db)):
     snap = {"ptype": r.ptype or p.ptype, "team": r.team or p.team,
             "cooled": p.cooled if r.cooled is None else r.cooled, "packed": p.packed if r.packed is None else r.packed}
     return {"date": d.isoformat(), "product": {"id": p.id, "name": p.name, **snap},
-            "ok": r.ok, "calc": calc, "trace": t, "attribution": r.attribution or [], "issues": issues}
+            "ok": r.ok, "calc": calc, "trace": t, "attribution": r.attribution or [], "issues": issues,
+            "quality": r.quality, "loss_amount": s(r.loss_amount)}
 
 
 # ---------------------------------------------------------------- 异常清单
@@ -236,14 +246,15 @@ def energy_daily(db: Session, st: date, e: date):
             "water_ws_t": sm["water"]["workshop_per_ton"], "water_out_t": sm["water"]["outside_per_ton"],
             "gas_cost": sm["gas"]["cost"], "elec_cost": sm["elec"]["cost"], "water_cost": sm["water"]["cost"],
             "cost": r.data.get("cost_total"),
-            "complete": all(v["complete"] for v in sm.values()) and r.data.get("has_readings", False),
+            "complete": r.data.get("complete", all(v["complete"] for v in sm.values()) and r.data.get("has_readings", False)),
+            "notes": "；".join(r.data.get("notes", [])),
         })
     cols = [("date", "日期", "text"), ("output_jin", "总产量(斤)", "weight"), ("output_ton", "总产量(吨)", "ton"),
             ("gas", "用气(Nm³)", "qty"), ("elec", "用电(度)", "qty"), ("water", "全厂用水(吨)", "qty"),
             ("water_ws", "车间用水(吨)", "qty"), ("gas_t", "吨耗气(Nm³/吨)", "qty"), ("elec_t", "吨耗电(度/吨)", "qty"),
             ("water_t", "吨耗水", "qty"), ("water_ws_t", "车间吨耗水", "qty"), ("water_out_t", "车间外吨耗水", "qty"),
             ("gas_cost", "燃气费(元)", "money"), ("elec_cost", "电费(元)", "money"), ("water_cost", "水费(元)", "money"),
-            ("cost", "能耗费用合计(元)", "money")]
+            ("cost", "能耗费用合计(元)", "money"), ("notes", "说明（不完整原因）", "text")]
     return {"title": "能耗日报", "columns": cols, "rows": rows}
 
 
@@ -330,7 +341,31 @@ def energy_month(db: Session, month: str):
     lines.append({"label": "能耗费用合计(元)", "group": "cost", "kind": "cost", "values": vals, "total": total(vals)})
     for l in lines:
         l.pop("_key", None)
-    return {"title": f"能耗月报 {month}", "month": month, "days": [d.isoformat() for d in days], "lines": lines}
+    return {"title": f"能耗月报 {month}", "month": month, "days": [d.isoformat() for d in days], "lines": lines,
+            "notes": month_coverage(recs, days)}
+
+
+def month_coverage(recs: dict, days: list[date]) -> list[str]:
+    """月报的覆盖范围说明：月合计是“按抄表入账日累计”，漏抄、跨日、跨月、月末没读数都写出来。"""
+    notes = ["月合计按抄表入账日累计：某天的读数差记在抄表那天，漏抄的日子不平均摊分。"]
+    have = [d for d in days if d in recs and recs[d].data.get("has_readings")]
+    if not have:
+        return notes + ["本月没有抄表数据。"]
+    full = [d for d in have if recs[d].data.get("complete")]
+    notes.append(f"有抄表 {len(have)} 天，其中合计完整 {len(full)} 天。")
+    no_read = [d for d in days if d in recs and not recs[d].data.get("has_readings") and recs[d].total_output]
+    if no_read:
+        notes.append("这些天有产量但没抄表：" + "、".join(f"{d:%m-%d}" for d in no_read) + "。")
+    seen = set()
+    for d in have:
+        for mt in recs[d].data["meters"]:
+            if mt.get("cross_month") and (d, mt["name"]) not in seen:
+                seen.add((d, mt["name"]))
+                notes.append(f"{d:%m-%d} {mt['name']}：{mt['note']}，本月合计里含上月的部分。")
+    last = have[-1]
+    if last < days[-1]:
+        notes.append(f"最后一次抄表是 {last:%m-%d}，之后的用量还没入账，本月合计只到这天。")
+    return notes
 
 
 @router.get("/energy-month")
@@ -432,7 +467,8 @@ def respond(wb, filename):
 @router.get("/export/{name}")
 def export(name: str, start: str | None = None, end: str | None = None, month: str | None = None,
            product_id: int | None = None, day: str | None = None, kind: str | None = None,
-           all_materials: bool = False, db: Session = Depends(get_db)):
+           all_materials: bool = False, ptype: str | None = None, kw: str | None = None,
+           db: Session = Depends(get_db)):
     if name == "energy-month":
         rep = energy_month(db, month or date.today().strftime("%Y-%m"))
         wb = Workbook()
@@ -492,7 +528,7 @@ def export(name: str, start: str | None = None, end: str | None = None, month: s
     if name == "yield":
         rep = yield_report(db, st, e, all_materials)
     elif name == "cost":
-        rep = cost_report(db, st, e)
+        rep = cost_report(db, st, e, ptype, kw)
     elif name == "issues":
         rep = issue_report(db, st, e, kind)
     elif name == "energy-daily":

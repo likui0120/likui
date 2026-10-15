@@ -48,7 +48,7 @@ def make_engine(url: str = DB_URL):
     return eng
 
 
-def migrate(eng, metadata):
+def migrate(eng, metadata, dry_run: bool = False):
     """给已有数据库补上新加的列（create_all 只建新表，不改旧表）。
 
     只做“加列”这一种迁移：新列都允许为空，旧数据不受影响；计算结果表的新列下次重算时填上。
@@ -65,8 +65,9 @@ def migrate(eng, metadata):
             for col in table.columns:
                 if col.name in have:
                     continue
-                ddl = col.type.compile(dialect=eng.dialect)
-                conn.execute(text(f'ALTER TABLE "{table.name}" ADD COLUMN "{col.name}" {ddl}'))
+                if not dry_run:
+                    ddl = col.type.compile(dialect=eng.dialect)
+                    conn.execute(text(f'ALTER TABLE "{table.name}" ADD COLUMN "{col.name}" {ddl}'))
                 added.append(f"{table.name}.{col.name}")
     return added
 

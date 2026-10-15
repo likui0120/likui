@@ -19,7 +19,7 @@ def effective_rows(db: Session, model, key_col: str, day: date, extra=None):
 
 
 MATERIAL_ATTRS = ("needs_process", "category")
-PRODUCT_ATTRS = ("ptype", "team", "cooled", "packed", "source_material_id")
+PRODUCT_ATTRS = ("ptype", "team", "cooled", "packed", "source_material_id", "fallback_price")
 VERSIONED_ATTRS = {"material": MATERIAL_ATTRS, "product": PRODUCT_ATTRS}
 
 

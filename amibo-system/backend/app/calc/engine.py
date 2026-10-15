@@ -144,6 +144,7 @@ class DayCalc:
             r.product_id: r for r in db.scalars(select(DailyPacking).where(DailyPacking.date == day))
         }
         self.mat_res: dict[int, MatRes] = {}
+        self.mat_loss: dict[int, Decimal | None] = {}
 
     # ------------------------------------------------------------ 工具
 
@@ -266,6 +267,7 @@ class DayCalc:
         if loss:
             cost = price1 * rec.qty_in if price1 is not None else None
             cp.input_cost_actual = cp.input_cost_std = cost
+            cp.loss_amount = cost
             self.issue("alert", f"p:{p.id}:loss", p.name,
                        f"全损：芝麻 {rec.qty_in:.2f} 斤，麻油产量为 0" + (f"，损失原料成本 {cost:.2f} 元" if cost is not None else ""),
                        "oil")
@@ -331,7 +333,7 @@ class DayCalc:
                 key = f"m:{m.id}" if m.needs_process and r.source == "actual" and r.actual != r.std else None
                 lines.append(Line(bl.line_no, m.name, kind, bl.qty, r.p2a, r.p2s, key=key, info={
                     "price1": js(r.price1), "yield_actual": js(r.actual), "yield_std": js(r.std),
-                    "yield_source": r.source,
+                    "yield_source": r.source, "yield_std_missing": r.std_missing,
                 }))
 
         per_batch = sum(l.qty for l in lines)
@@ -354,6 +356,7 @@ class DayCalc:
         if cook_a == 0:
             cost = None if missing else batches * sum(l.qty * l.pa for l in lines)
             cp.input_cost_actual = cost
+            cp.loss_amount = cost
             self.issue("alert", f"p:{p.id}:loss", p.name,
                        f"全损：投料 {input_weight:.2f} 斤，出锅重/出机重为 0"
                        + (f"，损失投料成本 {cost:.2f} 元" if cost is not None else "（缺单价，损失金额算不出）"), "cook")
@@ -488,6 +491,14 @@ class DayCalc:
                 cp.diff_amount = cp.diff_price * w if w is not None else None
                 cp.attribution = self.attribute(lines, evaluate, p, packed, prec, w, cp.cool_source)
 
+            # 制冷/包装环节全损：损失 = 上一环节单价 × 上一环节重量
+            if cool_a == 0 and cp.out_price_actual is not None:
+                cp.loss_amount = cp.out_price_actual * rec.output_weight
+            elif pack_a == 0 and cp.prepack_weight:
+                pre_price = cp.cooled_price_actual if p.cooled else cp.out_price_actual
+                if pre_price is not None:
+                    cp.loss_amount = pre_price * cp.prepack_weight + bag_fee_total
+
         cp.trace = {
             "kind": p.ptype,
             "bom": {"id": bom.id, "effective_date": bom.effective_date.isoformat()},
@@ -541,6 +552,54 @@ class DayCalc:
             prev = cur
         return result
 
+    # ------------------------------------------------------------ 数据质量
+
+    QUALITY_NAMES = {"complete": "算全（全部实测）", "estimated": "算出（含估算）", "partial": "只算到中间环节",
+                     "loss": "全损", "none": "算不出"}
+
+    def quality_of(self, cp: CalcProduct, p) -> dict:
+        """这个产品当天的成本结果有多可靠：哪些用了标准值估算、缺哪些标准或记录、算到了哪一步。"""
+        flags: list[str] = []
+        estimated = False
+        t = cp.trace or {}
+        for line in t.get("lines", []):
+            if line.get("yield_source") == "std":
+                estimated = True
+                flags.append(f"{line['name']}当天没有处理记录，按标准出率估算")
+            if line.get("yield_std_missing"):
+                estimated = True
+                flags.append(f"{line['name']}缺 1→2 级标准出率")
+            rule = (line.get("rule") or "")
+            if "标准单价" in rule:
+                estimated = True
+                flags.append(f"{line['name']}无历史实际单价，用标准单价")
+        if cp.cool_source == "std":
+            estimated = True
+        for i in self.issues:
+            if i.kind == "warning" and i.item_key.startswith(f"p:{p.id}:"):
+                if "标准成本按实际出率计" in i.message or "估算" in i.message:
+                    estimated = True
+                flags.append(i.message)
+        # 这个产品应该算到哪一步
+        if p.ptype == "成品馅" and p.packed:
+            target, target_name = cp.final_price_actual, "成品单价"
+        elif p.cooled and p.ptype != "麻油":
+            target, target_name = cp.cooled_price_actual, "冷后单价"
+        else:
+            target, target_name = cp.out_price_actual, "出机单价"
+        if any(i.kind == "alert" and i.item_key == f"p:{p.id}:loss" for i in self.issues):
+            status = "loss"
+        elif not cp.ok:
+            status = "none"
+        elif target is None:
+            status = "partial"
+            flags.append(f"没算出{target_name}")
+        elif estimated:
+            status = "estimated"
+        else:
+            status = "complete"
+        return {"status": status, "label": self.QUALITY_NAMES[status], "flags": list(dict.fromkeys(flags))}
+
     # ------------------------------------------------------------ 主流程
 
     def run(self):
@@ -564,14 +623,20 @@ class DayCalc:
 
         for r in self.mat_res.values():
             m = r.m
+            if r.source == "actual" and r.actual == 0:
+                self.mat_loss[m.id] = r.price1 * r.qty1 if r.price1 is not None else None
             db.add(CalcMaterial(
                 date=self.day, material_id=m.id, qty1=r.qty1, qty2=r.qty2, actual_yield=r.actual,
                 std_yield=r.std, yield_source=r.source, price1=r.price1, price2_actual=r.p2a,
                 price2_std=r.p2s, used=r.used, category=m.category, needs_process=m.needs_process,
+                loss_amount=self.mat_loss.get(m.id),
             ))
             key = f"m:{m.id}:process"
             if r.source == "actual" and r.actual == 0:
-                self.issue("alert", key, m.name, f"全损：1 级领用 {r.qty1:.2f} 斤，2 级称重为 0", "process")
+                loss = self.mat_loss[m.id]
+                self.issue("alert", key, m.name, f"全损：1 级领用 {r.qty1:.2f} 斤，2 级称重为 0"
+                           + (f"，损失原料成本 {loss:.2f} 元" if loss is not None else "（缺 1 级单价，损失金额算不出）"),
+                           "process")
             elif r.source == "actual":
                 if r.std_missing:
                     self.issue("warning", key, m.name, "缺 1→2 级标准出率，标准成本按实际出率计", "process")
@@ -583,6 +648,7 @@ class DayCalc:
         for cp in results:
             p = self.products[cp.product_id]
             cp.ptype, cp.team, cp.cooled, cp.packed = p.ptype, p.team, p.cooled, p.packed
+            cp.quality = self.quality_of(cp, p)
             db.add(cp)
 
         # 当日总产量 = 各产品包装入库量 + 麻油产量

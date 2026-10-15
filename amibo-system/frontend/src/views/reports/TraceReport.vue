@@ -19,8 +19,20 @@
           <span class="pname">{{ t.product.name }}</span>
           <el-tag size="small">{{ t.product.ptype }}</el-tag>
           <el-tag size="small" type="info">{{ t.product.team }}</el-tag>
-          <el-tag v-if="!t.ok" size="small" type="danger">未出成本</el-tag>
+          <el-tag v-if="t.quality" size="small" :type="qType(t.quality.status)">{{ t.quality.label }}</el-tag>
+          <el-tag v-else-if="!t.ok" size="small" type="danger">未出成本</el-tag>
           <span class="muted" v-if="t.trace.bom">BOM 版本：{{ t.trace.bom.effective_date }} 起生效 · 锅数 {{ fmtQ(t.trace.batches) }} · 每锅投料 {{ fmtW(t.trace.per_batch) }} 斤</span>
+        </div>
+        <!-- 先给结论：最终单价、差额、全损 -->
+        <div class="summary">
+          <div><span class="muted">{{ finalLabel }}·实际</span><b class="num">{{ fmtP(finalA) }}</b></div>
+          <div><span class="muted">标准</span><b class="num">{{ fmtP(finalS) }}</b></div>
+          <div><span class="muted">差额（元/斤）</span><b class="num" :class="{ 'alert-text': Number(t.calc.diff_price) > 0 }">{{ fmtP(t.calc.diff_price) }}</b></div>
+          <div><span class="muted">当日差额（元）</span><b class="num" :class="{ 'alert-text': Number(t.calc.diff_amount) > 0 }">{{ fmtM(t.calc.diff_amount) }}</b></div>
+          <div v-if="t.loss_amount"><span class="muted">全损损失（元）</span><b class="num alert-text">{{ fmtM(t.loss_amount) }}</b></div>
+        </div>
+        <div v-if="t.quality && t.quality.flags.length" class="flags">
+          <div v-for="(f, i) in t.quality.flags" :key="i">· {{ f }}</div>
         </div>
         <IssueBox :issues="t.issues.map((i) => ({ ...i, object_name: t.product.name }))" />
       </div>
@@ -118,7 +130,7 @@
 
       <div class="card" v-if="t.calc.diff_price !== null">
         <div class="sec">③ 实际与标准的差额：{{ fmtP(t.calc.diff_price) }} 元/斤，当日 {{ fmtM(t.calc.diff_amount) }} 元</div>
-        <p class="hint">依次把每个环节的实际出率换成标准出率，看单价变化多少。各项相加等于总差额。正数表示这一项让成本高于标准。</p>
+        <p class="hint">按固定顺序（各原料 1→2 级 → 上游投料价 → 熟制/拌馅 → 制冷 → 包装）依次把实际出率换成标准出率，看单价变化多少。各项相加等于总差额；单项大小与替换顺序有关，用来找“主要是哪一步”，不是唯一的责任划分。正数表示这一项让成本高于标准。</p>
         <el-table :data="t.attribution" border size="small" empty-text="实际出率与标准一致，没有差额">
           <el-table-column prop="factor" label="因素" min-width="200" />
           <el-table-column label="元/斤" width="120" align="right"><template #default="{ row }"><span class="num" :class="{ 'alert-text': row.per_jin > 0 }">{{ fmtP(row.per_jin) }}</span></template></el-table-column>
@@ -133,7 +145,7 @@
 </template>
 
 <script setup>
-import { onMounted, ref, watch } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import DayPicker from '../../components/DayPicker.vue'
 import IssueBox from '../../components/IssueBox.vue'
@@ -147,15 +159,29 @@ const productId = ref(route.query.product_id ? Number(route.query.product_id) : 
 if (route.query.day) store.day = String(route.query.day)
 const t = ref(null)
 const notFound = ref(false)
+const qType = (s) => ({ complete: 'success', estimated: 'warning', partial: 'warning', loss: 'danger', none: 'danger' }[s] || 'info')
+// 这个产品最终看哪一个单价：成品看成品单价，半成品油看冷后单价，其余看出机单价
+const finalKey = computed(() => {
+  const p = t.value?.product || {}
+  if (p.ptype === '成品馅' && p.packed) return ['final', '成品单价']
+  if (p.cooled && p.ptype !== '麻油') return ['cooled', '冷后单价']
+  return ['out', '出机单价']
+})
+const finalLabel = computed(() => finalKey.value[1])
+const finalA = computed(() => t.value?.calc[finalKey.value[0] + '_price_actual'])
+const finalS = computed(() => t.value?.calc[finalKey.value[0] + '_price_std'])
 
+let seq = 0
 async function load() {
+  const my = ++seq
   t.value = null
   notFound.value = false
   if (!productId.value) return
   try {
-    t.value = await api.get('/api/reports/trace', { product_id: productId.value, day: store.day }, { silent: true })
+    const r = await api.get('/api/reports/trace', { product_id: productId.value, day: store.day }, { silent: true })
+    if (my === seq) t.value = r
   } catch (e) {
-    if (e.status === 404) notFound.value = true
+    if (my === seq && e.status === 404) notFound.value = true
   }
 }
 function source(row) {
@@ -190,4 +216,8 @@ watch([productId, () => store.day], load, { immediate: true })
 .arrow { display: flex; align-items: center; color: #8492a6; font-size: 20px; }
 .bags { margin-top: 8px; }
 .bar { height: 10px; border-radius: 3px; }
+.summary { display: flex; flex-wrap: wrap; gap: 8px 28px; margin: 12px 0 4px; }
+.summary > div { display: flex; flex-direction: column; }
+.summary b { font-size: 20px; }
+.flags { margin-top: 6px; color: #b26a00; font-size: 13px; line-height: 1.8; }
 </style>

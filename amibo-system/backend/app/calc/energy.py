@@ -51,16 +51,29 @@ def meter_usage(meter: Meter, ver: MeterVersion, rec: MeterReading | None, prev:
     if ver.mode == "direct":
         row["usage"] = js(rec.reading * ver.factor)
         return row, None
+    if prev is not None:
+        days = (rec.date - prev.date).days
+        if days > 1:
+            # 漏抄了几天：读数差是这几天的合计，不平均摊到每天，只标出区间
+            row["interval_days"] = days
+            row["note"] = f"区间用量：{prev.date:%m-%d} 至 {rec.date:%m-%d} 共 {days} 天"
+            if (prev.date.year, prev.date.month) != (rec.date.year, rec.date.month):
+                row["cross_month"] = True
+                row["note"] += "（跨月，含上月用量）"
     if rec.new_start is not None:
         # 换表
         diff = rec.reading - rec.new_start
         if prev is not None and rec.old_final is not None:
             diff += rec.old_final - prev.reading
+        elif prev is not None:
+            row["partial"] = True
+            row["note"] = "换表没填旧表最终读数，只算了新表部分"
         row.update(prev=js(prev.reading) if prev else None, prev_date=prev.date.isoformat() if prev else None,
                    replaced=True, old_final=js(rec.old_final), new_start=js(rec.new_start))
         row["usage"] = js(diff * ver.factor)
-        return row, None
+        return row, (row["note"] if row.get("partial") else None)
     if prev is None:
+        row["first"] = True
         row["note"] = "首次抄表，没有上期读数，当天不计用量"
         return row, None
     row["prev"], row["prev_date"] = js(prev.reading), prev.date.isoformat()
@@ -75,7 +88,8 @@ def calc_energy_day(db: Session, day: date, total_output_jin: Decimal):
     prices = {k: v.price for k, v in effective_rows(db, EnergyPrice, "energy", day).items()}
     meters = list(db.scalars(select(Meter).order_by(Meter.energy, Meter.sort, Meter.id)))
     rows, warnings = [], []
-    totals = {e: {"plant": Decimal(0), "workshop": Decimal(0), "complete": True} for e in ENERGIES}
+    totals = {e: {"plant": Decimal(0), "workshop": Decimal(0), "complete": True, "interval": False,
+                  "missing": [], "notes": []} for e in ENERGIES}
     today = {r.meter_id: r for r in db.scalars(select(MeterReading).where(MeterReading.date == day))}
     prevs = prev_readings(db, day)
     any_reading = bool(today)
@@ -90,6 +104,16 @@ def calc_energy_day(db: Session, day: date, total_output_jin: Decimal):
             warnings.append({"key": f"meter:{m.id}", "name": f"{ENERGIES[m.energy][0]}·{m.name}", "message": warn})
         u = Decimal(row["usage"]) if row["usage"] is not None else None
         t = totals[m.energy]
+        if counted:
+            if u is None:
+                t["missing"].append(m.name + ("（首次抄表）" if row.get("first") else "（未抄表）" if row["reading"] is None
+                                              else "（读数有误）"))
+            if row.get("interval_days"):
+                t["interval"] = True
+                t["notes"].append(f"{m.name} {row['note']}")
+            if row.get("partial"):
+                t["complete"] = False
+                t["notes"].append(f"{m.name} {row['note']}")
         for scope in ("plant", "workshop"):
             sign = getattr(ver, scope)
             if sign not in ("+", "-"):
@@ -102,18 +126,37 @@ def calc_energy_day(db: Session, day: date, total_output_jin: Decimal):
     tons = total_output_jin / JIN_PER_TON if total_output_jin else None
     summary = {}
     cost_total = Decimal(0)
+    cost_complete = True
+    notes = []
     for e, t in totals.items():
+        ename = ENERGIES[e][0]
         price = prices.get(e)
         cost = t["plant"] * price if price is not None else None
         if cost is not None:
             cost_total += cost
+        else:
+            cost_complete = False
+            if any_reading:
+                notes.append(f"{ename}：没有有效的能源单价，能耗费用不含{ename}")
+        if t["missing"] and any_reading:
+            notes.append(f"{ename}：{'、'.join(t['missing'])}，合计不完整")
+        notes.extend(f"{ename}：{n}" for n in t["notes"])
+        # 吨能耗只在当天合计完整、且不含跨日区间时算；否则分子不是“当天”的用量
+        per_ton_ok = bool(tons) and t["complete"] and not t["interval"]
+        if t["interval"] and any_reading:
+            notes.append(f"{ename}：含跨日区间用量，当天吨耗不计（月报按入账日累计）")
         summary[e] = {
             "plant": js(t["plant"]), "workshop": js(t["workshop"]), "complete": t["complete"],
+            "interval": t["interval"], "missing": t["missing"],
             "price": js(price), "cost": js(cost),
-            "per_ton": js(t["plant"] / tons) if tons else None,
-            "workshop_per_ton": js(t["workshop"] / tons) if tons and e == "water" else None,
-            "outside_per_ton": js((t["plant"] - t["workshop"]) / tons) if tons and e == "water" else None,
+            "per_ton": js(t["plant"] / tons) if per_ton_ok else None,
+            "workshop_per_ton": js(t["workshop"] / tons) if per_ton_ok and e == "water" else None,
+            "outside_per_ton": js((t["plant"] - t["workshop"]) / tons) if per_ton_ok and e == "water" else None,
         }
-    data = {"meters": rows, "summary": summary, "cost_total": js(cost_total),
-            "output_jin": js(total_output_jin), "output_ton": js(tons), "has_readings": any_reading}
+    if any_reading and not tons:
+        notes.append("当天没有总产量，吨能耗不计")
+    complete = any_reading and cost_complete and all(t["complete"] and not t["interval"] for t in totals.values())
+    data = {"meters": rows, "summary": summary, "cost_total": js(cost_total), "cost_complete": cost_complete,
+            "output_jin": js(total_output_jin), "output_ton": js(tons), "has_readings": any_reading,
+            "complete": complete, "notes": notes if any_reading else ["当天没有抄表"]}
     return data, warnings

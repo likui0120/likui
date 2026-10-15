@@ -1,8 +1,9 @@
 <template>
-  <div class="day-picker">
-    <el-button :icon="ArrowLeft" @click="move(-1)" />
-    <el-date-picker v-model="store.day" type="date" value-format="YYYY-MM-DD" :clearable="false" style="width: 150px" />
-    <el-button :icon="ArrowRight" @click="move(1)" />
+  <div class="day-picker" role="group" aria-label="选择日期">
+    <el-button :icon="ArrowLeft" aria-label="前一天" title="前一天" @click="move(-1)" />
+    <el-date-picker v-model="store.day" type="date" value-format="YYYY-MM-DD" :clearable="false" style="width: 150px"
+                    aria-label="日期" />
+    <el-button :icon="ArrowRight" aria-label="后一天" title="后一天" @click="move(1)" />
     <el-button link type="primary" @click="store.day = today()">今天</el-button>
   </div>
 </template>

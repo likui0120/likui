@@ -11,18 +11,13 @@ from sqlalchemy.orm import Session
 from . import backup
 from .api import daily, imports, master, reports
 from .api.common import parse_date
-from .db import Base, SessionLocal, engine, get_db, migrate
-from .models import CalcEnergy, CalcIssue, CalcProduct, Product
+from .db import Base, engine, get_db
+from .models import CalcEnergy, CalcIssue, CalcMaterial, CalcProduct, Product
+from .upgrade import upgrade
 
 backup.backup_before_upgrade(Base.metadata)  # 要加表/加列时先备份旧库
 Base.metadata.create_all(engine)
-if migrate(engine, Base.metadata):
-    # 加了新列（如计算结果的数据质量），把已有日期重算一遍填上
-    from .calc.engine import recalc_from
-
-    with SessionLocal() as _db:
-        recalc_from(_db, None)
-        _db.commit()
+upgrade()  # 旧数据库：先备份，补新列，重算填上；失败下次启动重试
 
 
 @asynccontextmanager
@@ -52,7 +47,24 @@ def dashboard(day: str, db: Session = Depends(get_db)):
     prods = {p.id: p for p in db.scalars(select(Product))}
     cps = list(db.scalars(select(CalcProduct).where(CalcProduct.date == d)))
     issues = list(db.scalars(select(CalcIssue).where(CalcIssue.date == d)))
-    diff = sum((c.diff_amount for c in cps if c.diff_amount is not None), start=0)
+    ptype = lambda c: c.ptype or prods[c.product_id].ptype  # noqa: E731
+    # 差额合计只算成品馅：半成品油、麻油的差额已经通过投料单价传进下游成品，再加一次就重复了
+    finals = [c for c in cps if ptype(c) == "成品馅"]
+    diff = sum((c.diff_amount for c in finals if c.diff_amount is not None), start=0)
+    diff_mid = sum((c.diff_amount for c in cps if ptype(c) != "成品馅" and c.diff_amount is not None), start=0)
+    # 全损损失单独列，不混进差额（混进去会把“报废了”读成“差额变小”）
+    mat_losses = list(db.scalars(select(CalcMaterial.loss_amount).where(
+        CalcMaterial.date == d, CalcMaterial.loss_amount.is_not(None))))
+    loss = sum((c.loss_amount for c in cps if c.loss_amount is not None), start=0) + sum(mat_losses, start=0)
+    loss_count = sum(1 for i in issues if i.kind == "alert" and i.item_key.endswith(":loss")) + sum(
+        1 for i in issues if i.kind == "alert" and i.message.startswith("全损") and i.item_key.startswith("m:"))
+    quality = {}
+    for c in cps:
+        st = (c.quality or {}).get("status", "complete" if c.ok else "none")
+        quality[st] = quality.get(st, 0) + 1
+    todo = [{"name": prods[c.product_id].name, "status": (c.quality or {}).get("label"),
+             "flags": (c.quality or {}).get("flags", [])[:3]}
+            for c in cps if (c.quality or {}).get("status") not in (None, "complete")]
     last = db.scalar(select(func.max(CalcEnergy.date)))
     return {
         "date": d.isoformat(),
@@ -60,13 +72,21 @@ def dashboard(day: str, db: Session = Depends(get_db)):
         "total_output": str(energy.total_output) if energy else None,
         "products": len(cps),
         "products_ok": sum(1 for c in cps if c.ok),
+        "quality": quality,
+        "todo": todo,
         "alerts": sum(1 for i in issues if i.kind == "alert"),
         "warnings": sum(1 for i in issues if i.kind == "warning"),
         "diff_amount": str(diff),
+        "diff_amount_mid": str(diff_mid),
+        "loss_amount": str(loss),
+        "loss_count": loss_count,
         "energy": energy.data["summary"] if energy else None,
         "energy_cost": energy.data.get("cost_total") if energy else None,
+        "energy_complete": energy.data.get("complete") if energy else None,
+        "energy_notes": energy.data.get("notes", []) if energy else [],
         "top": sorted(
-            [{"name": prods[c.product_id].name, "diff_amount": str(c.diff_amount), "diff_price": str(c.diff_price)}
+            [{"name": prods[c.product_id].name, "ptype": ptype(c), "diff_amount": str(c.diff_amount),
+              "diff_price": str(c.diff_price)}
              for c in cps if c.diff_amount is not None],
             key=lambda x: -abs(float(x["diff_amount"])))[:5],
     }

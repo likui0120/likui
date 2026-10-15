@@ -209,7 +209,12 @@ const EDITABLE = {
 const dirtySet = reactive(new Set())
 const dirty = computed(() => dirtySet.size > 0)
 const dirtyNames = computed(() => [...dirtySet].map((s) => SECTION_NAMES[s]).join('、'))
-const touch = (section) => { dirtySet.add(section) }
+// 每个页签的编辑次数：保存返回时，只有这期间没再改过才算已保存，保存中继续输入的新值不会被当成已保存
+const rev = reactive({})
+const touch = (section) => { dirtySet.add(section); rev[section] = (rev[section] || 0) + 1 }
+function markSaved(section, day, r0) {
+  if (day === store.day && (rev[section] || 0) === r0) dirtySet.delete(section)
+}
 const mark = (section) => (dirtySet.has(section) ? ' ●' : '')
 const has = (v) => v !== null && v !== undefined && v !== ''
 const num = (v) => (has(v) ? Number(v) : null)
@@ -292,10 +297,11 @@ async function load({ clearAll = false } = {}) {
 
 async function save(section, rows) {
   const day = store.day
+  const r0 = rev[section] || 0
   saving.value = true
   try {
-    const r = await api.put(`/api/daily/${day}/${section}`, rows)
-    dirtySet.delete(section)
+    const r = await api.put(`/api/daily/${day}/${section}`, JSON.parse(JSON.stringify(rows)))
+    markSaved(section, day, r0)
     if (day !== store.day) return
     data.issues = r.issues
     const alerts = r.issues.filter((i) => i.kind === 'alert').length
@@ -309,10 +315,11 @@ async function save(section, rows) {
 
 async function savePrices() {
   const day = store.day
+  const r0 = rev.prices || 0
   saving.value = true
   try {
     await api.put(`/api/material-prices/${day}`, data.prices.map((p) => ({ material_id: p.material_id, price: p.price })))
-    dirtySet.delete('prices')
+    markSaved('prices', day, r0)
     ElMessage.success('单价已保存并重算')
     if (day === store.day) await load()
   } finally {

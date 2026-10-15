@@ -7,11 +7,11 @@
       <el-button @click="download('/api/reports/export/energy-daily', { start: range[0], end: range[1] })">导出 Excel</el-button>
     </div>
     <div class="card" v-loading="loading">
-      <p class="hint">吨能耗 = 合计用量 ÷ 当日总产量（吨），总产量 = 各产品包装入库量 + 麻油产量，吨 = 斤 ÷ 2000。能耗费用 = 全厂合计用量 × 未税单价。点日期看每块表的读数与用量。</p>
+      <p class="hint">吨能耗 = 合计用量 ÷ 当日总产量（吨），当天有表没抄、或读数差跨了几天时不算吨耗（标“不完整”，鼠标放上去看原因）。总产量 = 各产品包装入库量 + 麻油产量，吨 = 斤 ÷ 2000。能耗费用 = 全厂合计用量 × 未税单价。点日期看每块表的读数与用量。</p>
       <ReportTable :columns="rep.columns" :rows="rep.rows" :fixed="['date']" max-height="calc(100vh - 260px)">
         <template #date="{ row }">
           <el-button link type="primary" @click="openDay(row.date)">{{ row.date }}</el-button>
-          <el-tooltip v-if="!row.complete" content="有计入合计的表当天没抄或读数有问题，合计不完整"><el-tag size="small" type="warning">不完整</el-tag></el-tooltip>
+          <el-tooltip v-if="!row.complete" :content="row.notes || '合计不完整'"><el-tag size="small" type="warning">不完整</el-tag></el-tooltip>
         </template>
       </ReportTable>
     </div>
@@ -29,6 +29,7 @@
           </el-table-column>
           <el-table-column label="全厂/车间" width="96"><template #default="{ row }">{{ m(row.plant) }} / {{ m(row.workshop) }}</template></el-table-column>
         </el-table>
+        <div v-if="detail.notes && detail.notes.length" class="notes"><div v-for="(n, i) in detail.notes" :key="i">· {{ n }}</div></div>
         <div class="sum">
           <div v-for="(v, k) in detail.summary" :key="k">
             <b>{{ ({ gas: '燃气', water: '水', elec: '电' })[k] }}</b>：全厂合计 {{ fmtQ(v.plant) }}
@@ -68,4 +69,5 @@ watch(range, load, { immediate: true })
 
 <style scoped>
 .sum { margin-top: 12px; line-height: 2; font-size: 13px; }
+.notes { margin-top: 10px; color: #b26a00; font-size: 13px; line-height: 1.8; }
 </style>

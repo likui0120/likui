@@ -149,3 +149,109 @@ def test_migrate_adds_missing_columns(tmp_path):
     assert migrate(eng, md) == ["t.extra"]
     assert "extra" in {c["name"] for c in inspect(eng).get_columns("t")}
     assert migrate(eng, md) == []
+
+# ---------------------------------------------------------------- 第二轮：全损金额、数据质量、能耗区间、升级可重试
+
+def _cost_row(name, day=DAY):
+    rows = client.get("/api/reports/cost", params={"start": day, "end": day}).json()["rows"]
+    return next(r for r in rows if r["name"] == name)
+
+
+def test_loss_amount_cooling_stage(demo):
+    d = client.get(f"/api/daily/{DAY}").json()
+    row = next(r for r in d["cooling"] if r["name"] == "粉丝馅料")
+    r = client.put(f"/api/daily/{DAY}/cooling", json=[{**row, "cooled_weight": "0"}])
+    assert r.status_code == 200, r.text
+    assert any("全损" in i["message"] and i["kind"] == "alert" for i in r.json()["issues"])
+    c = _cost_row("粉丝馅料")
+    assert c["quality"] == "全损" and c["loss_amount"] and float(c["loss_amount"]) > 0
+    dash = client.get("/api/dashboard", params={"day": DAY}).json()
+    assert float(dash["loss_amount"]) > 0 and dash["quality"].get("loss") == 1
+
+
+def test_loss_amount_packing_stage(demo):
+    d = client.get(f"/api/daily/{DAY}").json()
+    row = next(r for r in d["packing"] if r["name"] == "粉丝馅料")
+    r = client.put(f"/api/daily/{DAY}/packing", json=[{**row, "packed_weight": "0", "bags": {}}])
+    assert r.status_code == 200, r.text
+    c = _cost_row("粉丝馅料")
+    assert c["quality"] == "全损" and float(c["loss_amount"]) > 0
+
+
+def test_loss_amount_material(demo):
+    d = client.get(f"/api/daily/{DAY}").json()
+    row = next(r for r in d["process"] if r["qty1"])
+    r = client.put(f"/api/daily/{DAY}/process", json=[{**row, "qty2": "0"}])
+    assert r.status_code == 200, r.text
+    loss = [i for i in r.json()["issues"] if i["object_name"] == row["name"] and "全损" in i["message"]]
+    assert loss and "损失原料成本" in loss[0]["message"]
+    dash = client.get("/api/dashboard", params={"day": DAY}).json()
+    assert float(dash["loss_amount"]) > 0
+
+
+def test_quality_estimated_when_no_process_record(demo):
+    """原料当天没有处理记录、按标准出率算：结果标为“含估算”并写明原因。"""
+    d = client.get(f"/api/daily/{DAY}").json()
+    rows = [{**r, "qty1": None, "qty2": None} for r in d["process"] if r["qty1"]]
+    client.put(f"/api/daily/{DAY}/process", json=rows)
+    c = _cost_row("粉丝馅料")
+    assert c["quality"] == "算出（含估算）"
+    assert "按标准出率估算" in c["quality_flags"]
+
+
+def test_dashboard_diff_counts_only_finished_goods(demo):
+    dash = client.get("/api/dashboard", params={"day": DAY}).json()
+    rows = client.get("/api/reports/cost", params={"start": DAY, "end": DAY}).json()["rows"]
+    finals = sum(float(r["diff_amount"]) for r in rows if r["ptype"] == "成品馅" and r["diff_amount"])
+    assert abs(float(dash["diff_amount"]) - finals) < 1e-6
+
+
+def test_energy_interval_not_counted_in_daily_per_ton(demo):
+    """漏抄一天：读数差记在抄表那天，标“区间用量”，当天吨耗不算；月报说明覆盖范围。"""
+    from app.models import MeterReading
+
+    db = demo
+    first = db.scalars(select(MeterReading).where(MeterReading.date == eng.date(2026, 10, 13))).all()
+    for r in first:
+        db.delete(r)
+    db.flush()
+    eng.recalc_from(db, None)
+    db.commit()
+    day = client.get("/api/reports/energy-day", params={"day": "2026-10-14"}).json()
+    assert any(m.get("interval_days") == 2 for m in day["meters"])
+    assert day["summary"]["elec"]["per_ton"] is None and day["complete"] is False
+    assert any("区间用量" in n for n in day["notes"])
+    month = client.get("/api/reports/energy-month", params={"month": "2026-10"}).json()
+    assert any("入账日累计" in n for n in month["notes"])
+
+
+def test_a04_invalid_value_for_earlier_date_rejected(demo):
+    """已有未来版本时，给更早日期写一个非法班组也要被拦住（校验的是要写进版本的值）。"""
+    prods = client.get("/api/products").json()
+    p = next(x for x in prods if x["name"] == "粉丝馅料")
+    client.put(f"/api/products/{p['id']}", json={"team": "拌馅组", "attr_effective_date": "2026-10-14"})
+    r = client.put(f"/api/products/{p['id']}", json={"team": "不存在的班组", "attr_effective_date": "2026-10-12"})
+    assert r.status_code == 400
+
+
+def test_upgrade_backfill_retries_after_failure(demo, monkeypatch):
+    from app import upgrade as up
+    from app.models import Setting
+
+    db = demo
+    db.add(Setting(key=up.PENDING_KEY, value="1"))
+    db.commit()
+
+    def boom(*a, **k):
+        raise RuntimeError("模拟断电")
+
+    monkeypatch.setattr(eng, "recalc_from", boom)
+    out = up.upgrade()
+    assert "error" in out
+    with SessionLocal() as s:
+        assert s.get(Setting, up.PENDING_KEY) is not None  # 标记还在，下次启动重试
+    monkeypatch.undo()
+    out = up.upgrade()
+    assert out["backfilled"] is True
+    with SessionLocal() as s:
+        assert s.get(Setting, up.PENDING_KEY) is None
