@@ -11,10 +11,17 @@ from sqlalchemy.orm import Session
 from . import backup
 from .api import daily, imports, master, reports
 from .api.common import parse_date
-from .db import Base, engine, get_db
+from .db import Base, SessionLocal, engine, get_db, migrate
 from .models import CalcEnergy, CalcIssue, CalcProduct, Product
 
 Base.metadata.create_all(engine)
+if migrate(engine, Base.metadata):
+    # 加了新列（如计算结果的数据质量），把已有日期重算一遍填上
+    from .calc.engine import recalc_from
+
+    with SessionLocal() as _db:
+        recalc_from(_db, None)
+        _db.commit()
 
 
 @asynccontextmanager

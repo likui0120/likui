@@ -7,12 +7,14 @@ from sqlalchemy.orm import Session
 
 from ..db import get_db
 from ..models import (
-    ENERGIES, INCLUDE_MODES, MATERIAL_CATEGORIES, PRODUCT_TYPES, STAGES, TEAMS, AlertThreshold, Bom, BomLine,
+    ENERGIES, INCLUDE_MODES, MATERIAL_CATEGORIES, PRODUCT_TYPES, STAGES, TEAMS, AlertThreshold, AttrVersion, Bom, BomLine,
+    ChangeLog,
     EnergyPrice, Material, MaterialPrice, MaterialStdYield, Meter, MeterVersion, PackSpec, PackSpecVersion,
     Product, ProductStdYield, SeasoningPrice,
 )
 from ..settings import all_settings, set_setting
-from .common import flush_or_400, crud_router, parse_date, parse_dec, recalc_after, to_dict
+from ..calc.versions import VERSIONED_ATTRS
+from .common import apply_payload, flush_or_400, log_change, parse_bool, crud_router, parse_date, parse_dec, recalc_after, to_dict
 
 router = APIRouter(prefix="/api")
 
@@ -110,6 +112,71 @@ def v_threshold(db, r: AlertThreshold):
         _bad("请选择产品")
 
 
+def versioned_attrs_hook(entity: str):
+    """原料/产品修改：影响计算的属性按“从哪天起生效”存版本，历史日期仍按当时的值算。
+
+    请求体可带：
+    - attr_effective_date：这些属性从哪天起生效（默认今天）
+    - attr_correction：true 表示“之前录错了”，所有历史一起改
+    其他字段（名称、编码、备注等）直接改。
+    """
+    fields = VERSIONED_ATTRS[entity]
+
+    def hook(db: Session, row, payload: dict):
+        eff = payload.pop("attr_effective_date", None)
+        correction = parse_bool(payload.pop("attr_correction", False), "是否修正历史")
+        old = {f: getattr(row, f) for f in fields}
+        apply_payload(row, payload)
+        new = {f: getattr(row, f) for f in fields}
+        changed = {f: new[f] for f in fields if new[f] != old[f]}
+        if not changed:
+            return None
+        versions = list(db.scalars(select(AttrVersion).where(
+            AttrVersion.entity == entity, AttrVersion.entity_id == row.id).order_by(AttrVersion.effective_date)))
+        if correction:
+            for v in versions:
+                v.data = {**v.data, **changed}
+            log_change(db, row.__tablename__, row.id, "update", old, new, None, "修正历史：所有日期一起改")
+            return None
+        d = parse_date(eff) if eff else date.today()
+        if not versions:
+            # 第一次版本化：改之前的值作为“从最早起”的版本
+            first = AttrVersion(entity=entity, entity_id=row.id, effective_date=date(1900, 1, 1), data=old)
+            db.add(first)
+            versions = [first]
+        at = next((v for v in versions if v.effective_date == d), None)
+        if at is not None:
+            at.data = {**at.data, **changed}
+        else:
+            base = [v for v in versions if v.effective_date <= d]
+            data = {**(base[-1].data if base else old), **changed}
+            at = AttrVersion(entity=entity, entity_id=row.id, effective_date=d, data=data)
+            db.add(at)
+            versions = sorted(versions + [at], key=lambda v: v.effective_date)
+        # 资料表本身保存最新一版的值
+        for f, v in versions[-1].data.items():
+            setattr(row, f, v)
+        log_change(db, row.__tablename__, row.id, "update", old, changed, d, f"从 {d.isoformat()} 起生效")
+        return d
+
+    return hook
+
+
+@router.get("/attr-versions")
+def list_attr_versions(entity: str, entity_id: int, db: Session = Depends(get_db)):
+    rows = db.scalars(select(AttrVersion).where(AttrVersion.entity == entity, AttrVersion.entity_id == entity_id)
+                      .order_by(AttrVersion.effective_date))
+    return [to_dict(r) for r in rows]
+
+
+@router.get("/change-log")
+def list_change_log(limit: int = 200, db: Session = Depends(get_db)):
+    rows = db.scalars(select(ChangeLog).order_by(ChangeLog.id.desc()).limit(min(limit, 1000)))
+    return [to_dict(r) for r in rows]
+
+
+HOOKS = {Material: versioned_attrs_hook("material"), Product: versioned_attrs_hook("product")}
+
 for model, prefix, order, versioned, validate in [
     (Material, "/materials", (Material.category, Material.name), False, v_material),
     (MaterialStdYield, "/material-std-yields", (MaterialStdYield.material_id, MaterialStdYield.effective_date), True, v_material_std),
@@ -123,7 +190,8 @@ for model, prefix, order, versioned, validate in [
     (EnergyPrice, "/energy-prices", (EnergyPrice.energy, EnergyPrice.effective_date), True, v_energy_price),
     (AlertThreshold, "/thresholds", (AlertThreshold.scope, AlertThreshold.id), False, v_threshold),
 ]:
-    router.include_router(crud_router(model, prefix, order_by=order, versioned=versioned, validate=validate))
+    router.include_router(crud_router(model, prefix, order_by=order, versioned=versioned, validate=validate,
+                                      update_hook=HOOKS.get(model)))
 
 
 

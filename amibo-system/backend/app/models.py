@@ -217,6 +217,38 @@ class AlertThreshold(Base):
     value: Mapped[object] = mapped_column(Dec)
 
 
+class AttrVersion(Base):
+    """原料、产品里影响计算的属性的版本（带生效日期）。
+
+    原料：needs_process、category；产品：ptype、team、cooled、packed、source_material_id。
+    某个原料/产品一旦有版本，计算某天时就用当天有效的版本；没有版本就用资料表里的当前值。
+    资料表本身始终保存最新一版的值。
+    """
+
+    __tablename__ = "attr_version"
+    __table_args__ = (UniqueConstraint("entity", "entity_id", "effective_date"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    entity: Mapped[str] = mapped_column(String(16))  # material / product
+    entity_id: Mapped[int] = mapped_column(Integer, index=True)
+    effective_date: Mapped[date] = mapped_column(Date)
+    data: Mapped[dict] = mapped_column(JSON)
+
+
+class ChangeLog(Base):
+    """基础资料修改日志：改了什么、改前改后、从哪天起影响。用于追查历史结果为什么变了。"""
+
+    __tablename__ = "change_log"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, index=True)
+    table: Mapped[str] = mapped_column(String(32))
+    row_id: Mapped[int | None] = mapped_column(Integer)
+    action: Mapped[str] = mapped_column(String(16))  # create / update / delete
+    old: Mapped[dict | None] = mapped_column(JSON)
+    new: Mapped[dict | None] = mapped_column(JSON)
+    affect_from: Mapped[date | None] = mapped_column(Date)  # 影响从哪天起的结果（空 = 全部历史）
+    note: Mapped[str | None] = mapped_column(Text)
+
+
 class Setting(Base):
     """全局设置（键值）。"""
 
@@ -330,6 +362,9 @@ class CalcMaterial(Base):
     price2_actual: Mapped[object | None] = mapped_column(Dec)
     price2_std: Mapped[object | None] = mapped_column(Dec)
     used: Mapped[bool] = mapped_column(Boolean, default=False)  # 当天有产品用到
+    # 计算当天用的属性（报表按这个归类，不随资料后来的修改变化）
+    category: Mapped[str | None] = mapped_column(String(16))
+    needs_process: Mapped[bool | None] = mapped_column(Boolean)
 
 
 class CalcProduct(Base):
@@ -366,6 +401,14 @@ class CalcProduct(Base):
     diff_amount: Mapped[object | None] = mapped_column(Dec)
     trace: Mapped[dict | None] = mapped_column(JSON)
     attribution: Mapped[list | None] = mapped_column(JSON)
+    # 计算当天用的属性（报表按这个归类，不随资料后来的修改变化）
+    ptype: Mapped[str | None] = mapped_column(String(16))
+    team: Mapped[str | None] = mapped_column(String(16))
+    cooled: Mapped[bool | None] = mapped_column(Boolean)
+    packed: Mapped[bool | None] = mapped_column(Boolean)
+    # 数据质量：status = complete（成品/最终单价算全，全部实测）/ estimated（算出但用了标准值估算）
+    #   / partial（只算到中间环节）/ loss（全损）/ none（算不出）；flags 列出原因
+    quality: Mapped[dict | None] = mapped_column(JSON)
 
 
 class CalcIssue(Base):

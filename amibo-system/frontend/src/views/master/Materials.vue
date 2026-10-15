@@ -52,7 +52,7 @@ import VersionDialog from '../../components/VersionDialog.vue'
 import { api } from '../../api'
 import { store } from '../../store'
 import { fmtY } from '../../fmt'
-import { currentVersion } from '../../versions'
+import { attrVersionFields, currentVersion } from '../../versions'
 
 const list = ref([])
 const stds = ref([])
@@ -72,6 +72,7 @@ const fields = computed(() => [
   { key: 'needs_process', label: '需要 1→2 级处理', type: 'bool' },
   { key: 'active', label: '启用', type: 'bool', default: true },
   { key: 'note', label: '备注', type: 'textarea' },
+  ...attrVersionFields(() => !!editing.value, '类别、是否需要处理'),
 ])
 async function load() {
   ;[list.value, stds.value] = await Promise.all([api.get('/api/materials'), api.get('/api/material-std-yields')])

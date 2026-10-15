@@ -5,6 +5,7 @@ import calendar
 import io
 from datetime import date, timedelta
 from decimal import Decimal
+from types import SimpleNamespace
 from urllib.parse import quote
 
 from fastapi import APIRouter, Body, Depends, HTTPException
@@ -63,6 +64,8 @@ def yield_report(db: Session, st: date, e: date, all_materials: bool = False):
     for r in db.scalars(select(CalcMaterial).where(CalcMaterial.date >= st, CalcMaterial.date <= e)
                         .order_by(CalcMaterial.date, CalcMaterial.material_id)):
         m = mats[r.material_id]
+        # 类别按计算当天的版本（存在计算结果里），资料后来改了也不影响历史报表
+        m = SimpleNamespace(id=m.id, name=m.name, category=r.category or m.category)
         if r.yield_source == "fixed" and not all_materials:
             continue
         key = f"m:{m.id}:process"
@@ -75,6 +78,8 @@ def yield_report(db: Session, st: date, e: date, all_materials: bool = False):
     for r in db.scalars(select(CalcProduct).where(CalcProduct.date >= st, CalcProduct.date <= e)
                         .order_by(CalcProduct.date, CalcProduct.product_id)):
         p = prods[r.product_id]
+        p = SimpleNamespace(id=p.id, name=p.name, ptype=r.ptype or p.ptype, team=r.team or p.team,
+                            cooled=p.cooled if r.cooled is None else r.cooled)
         stage = "oil" if p.ptype == "麻油" else "cook"
         key = f"p:{p.id}:{stage}"
         rows.append({"date": r.date.isoformat(), "stage": stage, "stage_name": STAGES[stage], "name": p.name,
@@ -118,8 +123,8 @@ def cost_report(db: Session, st: date, e: date):
     for r in db.scalars(select(CalcProduct).where(CalcProduct.date >= st, CalcProduct.date <= e)
                         .order_by(CalcProduct.date, CalcProduct.product_id)):
         p = prods[r.product_id]
-        rows.append({"date": r.date.isoformat(), "product_id": p.id, "name": p.name, "ptype": p.ptype,
-                     "team": p.team, "ok": r.ok, "input_cost": s(r.input_cost_actual),
+        rows.append({"date": r.date.isoformat(), "product_id": p.id, "name": p.name, "ptype": r.ptype or p.ptype,
+                     "team": r.team or p.team, "ok": r.ok, "input_cost": s(r.input_cost_actual),
                      "out_a": s(r.out_price_actual), "out_s": s(r.out_price_std),
                      "cooled_a": s(r.cooled_price_actual), "cooled_s": s(r.cooled_price_std),
                      "final_a": s(r.final_price_actual), "final_s": s(r.final_price_std),
@@ -159,8 +164,9 @@ def trace(product_id: int, day: str, db: Session = Depends(get_db)):
         "out_price_actual", "out_price_std", "cooled_weight", "cool_yield_actual", "cool_yield_std", "cool_source",
         "cooled_price_actual", "cooled_price_std", "prepack_weight", "packed_weight", "pack_yield_actual",
         "pack_yield_std", "bag_fee", "final_price_actual", "final_price_std", "diff_price", "diff_amount")}
-    return {"date": d.isoformat(), "product": {"id": p.id, "name": p.name, "ptype": p.ptype, "team": p.team,
-                                                "cooled": p.cooled, "packed": p.packed},
+    snap = {"ptype": r.ptype or p.ptype, "team": r.team or p.team,
+            "cooled": p.cooled if r.cooled is None else r.cooled, "packed": p.packed if r.packed is None else r.packed}
+    return {"date": d.isoformat(), "product": {"id": p.id, "name": p.name, **snap},
             "ok": r.ok, "calc": calc, "trace": t, "attribution": r.attribution or [], "issues": issues}
 
 

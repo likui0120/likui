@@ -28,7 +28,7 @@ from ..models import (
 )
 from ..settings import get_setting
 from .energy import calc_energy_day
-from .versions import effective_rows
+from .versions import effective_rows, materials_on, products_on
 
 ONE = Decimal(1)
 ZERO = Decimal(0)
@@ -120,8 +120,9 @@ class DayCalc:
         self.suspect = Decimal(get_setting(db, "suspect_pp"))
         self.sesame_rule = get_setting(db, "sesame_rule")
 
-        self.materials = {m.id: m for m in db.scalars(select(Material))}
-        self.products = {p.id: p for p in db.scalars(select(Product))}
+        # 原料/产品按当天有效的属性版本（是否处理、是否制冷等），历史日期用当时的设置
+        self.materials = materials_on(db, day)
+        self.products = products_on(db, day)
         self.mat_std = {k: v.std_yield for k, v in effective_rows(db, MaterialStdYield, "material_id", day).items()}
         self.prod_std = effective_rows(db, ProductStdYield, "product_id", day)
         self.season = {k: v.price for k, v in effective_rows(db, SeasoningPrice, "material_id", day).items()}
@@ -566,7 +567,7 @@ class DayCalc:
             db.add(CalcMaterial(
                 date=self.day, material_id=m.id, qty1=r.qty1, qty2=r.qty2, actual_yield=r.actual,
                 std_yield=r.std, yield_source=r.source, price1=r.price1, price2_actual=r.p2a,
-                price2_std=r.p2s, used=r.used,
+                price2_std=r.p2s, used=r.used, category=m.category, needs_process=m.needs_process,
             ))
             key = f"m:{m.id}:process"
             if r.source == "actual" and r.actual == 0:
@@ -580,6 +581,8 @@ class DayCalc:
                 self.issue("warning", key, m.name, "当天没有处理记录，也没有标准出率", "process")
 
         for cp in results:
+            p = self.products[cp.product_id]
+            cp.ptype, cp.team, cp.cooled, cp.packed = p.ptype, p.team, p.cooled, p.packed
             db.add(cp)
 
         # 当日总产量 = 各产品包装入库量 + 麻油产量

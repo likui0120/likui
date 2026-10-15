@@ -136,6 +136,20 @@ def recalc_after(db: Session, start: date | None):
     return summary
 
 
+def log_change(db: Session, table: str, row_id, action: str, old: dict | None, new: dict | None,
+               affect_from: date | None = None, note: str | None = None):
+    """记一条资料修改日志（只记真的有变化的字段）。"""
+    from ..models import ChangeLog
+
+    if old is not None and new is not None:
+        keys = [k for k in new if old.get(k) != new.get(k)]
+        if not keys:
+            return
+        old, new = {k: old.get(k) for k in keys}, {k: new.get(k) for k in keys}
+    db.add(ChangeLog(table=table, row_id=row_id, action=action, old=jsonable(old), new=jsonable(new),
+                     affect_from=affect_from, note=note))
+
+
 def commit_only(db: Session):
     try:
         db.commit()
@@ -144,7 +158,7 @@ def commit_only(db: Session):
 
 
 def crud_router(model, prefix: str, *, order_by=None, versioned: bool = False,
-                recalc: bool = True, decorate=None, validate=None) -> APIRouter:
+                recalc: bool = True, decorate=None, validate=None, update_hook=None) -> APIRouter:
     """通用增删改查。versioned=True 的表按生效日期重算，否则改动后全部重算。"""
     r = APIRouter(prefix=prefix)
 
@@ -178,12 +192,22 @@ def crud_router(model, prefix: str, *, order_by=None, versioned: bool = False,
         if row is None:
             raise HTTPException(404, "记录不存在")
         old = getattr(row, "effective_date", None)
-        apply_payload(row, payload)
+        before = to_dict(row)
+        if update_hook:
+            # 自己处理属性版本，返回重算起点（None = 全部重算）
+            start = update_hook(db, row, dict(payload))
+        else:
+            apply_payload(row, payload)
+            new = getattr(row, "effective_date", None)
+            start = min(d for d in (old, new) if d) if (old or new) else None
         if validate:
             validate(db, row)
         flush_or_400(db)
-        new = getattr(row, "effective_date", None)
-        after(db, min(d for d in (old, new) if d) if (old or new) else None)
+        log_change(db, model.__tablename__, row_id, "update", before, to_dict(row), start)
+        if recalc:
+            recalc_after(db, start)
+        else:
+            commit_only(db)
         return to_dict(row)
 
     @r.delete("/{row_id}")
@@ -192,6 +216,7 @@ def crud_router(model, prefix: str, *, order_by=None, versioned: bool = False,
         if row is None:
             raise HTTPException(404, "记录不存在")
         d = getattr(row, "effective_date", None)
+        log_change(db, model.__tablename__, row_id, "delete", to_dict(row), None, d)
         db.delete(row)
         flush_or_400(db)
         after(db, d)

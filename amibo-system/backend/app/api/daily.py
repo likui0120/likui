@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session
 
 from ..calc.energy import prev_reading
 from ..calc.engine import Thresholds
-from ..calc.versions import effective_rows
+from ..calc.versions import effective_rows, materials_on, products_on
 from ..db import get_db
 from ..models import (
     Bom, CalcIssue, DailyCooling, DailyMaterialProcess, DailyPacking, DailyPackingBag, DailyProduction,
@@ -28,7 +28,8 @@ def day_issues(db: Session, d):
 @router.get("/{day}")
 def get_day(day: str, db: Session = Depends(get_db)):
     d = parse_date(day)
-    mats = list(db.scalars(select(Material).order_by(Material.category, Material.name)))
+    # 按当天有效的属性版本（是否需要处理、类别）决定显示哪些行
+    mats = sorted(materials_on(db, d).values(), key=lambda m: (m.category or "", m.name))
     mat_std = effective_rows(db, MaterialStdYield, "material_id", d)
     th = Thresholds(db)  # 录入页即时标红和后端异常用同一套阈值
     proc = {r.material_id: r for r in db.scalars(select(DailyMaterialProcess).where(DailyMaterialProcess.date == d))}
@@ -40,7 +41,7 @@ def get_day(day: str, db: Session = Depends(get_db)):
         "qty2": s(proc[m.id].qty2) if m.id in proc else None,
     } for m in mats if (m.needs_process and m.active) or m.id in proc]
 
-    prods = list(db.scalars(select(Product).order_by(Product.sort, Product.team, Product.name)))
+    prods = sorted(products_on(db, d).values(), key=lambda p: (p.sort or 0, p.team or "", p.name))
     pstd = effective_rows(db, ProductStdYield, "product_id", d)
     boms = effective_rows(db, Bom, "product_id", d)
     prod = {r.product_id: r for r in db.scalars(select(DailyProduction).where(DailyProduction.date == d))}

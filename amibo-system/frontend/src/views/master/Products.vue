@@ -51,7 +51,7 @@ import VersionDialog from '../../components/VersionDialog.vue'
 import { api } from '../../api'
 import { store } from '../../store'
 import { fmtY } from '../../fmt'
-import { currentVersion } from '../../versions'
+import { attrVersionFields, currentVersion } from '../../versions'
 
 const list = ref([])
 const stds = ref([])
@@ -79,6 +79,7 @@ const fields = computed(() => [
   { key: 'sort', label: '排序', type: 'num', default: 0 },
   { key: 'active', label: '启用', type: 'bool', default: true },
   { key: 'note', label: '备注', type: 'textarea' },
+  ...attrVersionFields(() => !!editing.value, '类型、班组、是否制冷、是否包装、芝麻原料'),
 ])
 const stdFields = computed(() => {
   const p = stdFor.value || {}
