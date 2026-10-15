@@ -24,12 +24,23 @@ def _saved_output(pid):
             DailyProduction.product_id == pid, DailyProduction.date == eng.date.fromisoformat(DAY))).first()
 
 
-def test_a02_zero_output_rejected_and_nothing_saved(demo):
+def test_a02_zero_output_kept_as_total_loss(demo):
+    """出锅重 0 = 整批报废：原始记录保留，提示全损和损失金额，不出单位成本。"""
     fs = _row("粉丝馅料")
-    before = _saved_output(fs["product_id"])
     r = client.put(f"/api/daily/{DAY}/production", json=[{**fs, "output_weight": "0"}])
-    assert r.status_code == 400 and "不能为 0" in r.json()["detail"]
-    assert _saved_output(fs["product_id"]) == before
+    assert r.status_code == 200, r.text
+    assert _saved_output(fs["product_id"]) == 0
+    loss = [i for i in r.json()["issues"] if i["object_name"] == "粉丝馅料" and "全损" in i["message"]]
+    assert loss and loss[0]["kind"] == "alert" and "损失投料成本" in loss[0]["message"]
+    c = client.get("/api/reports/cost", params={"start": DAY, "end": DAY}).json()["rows"]
+    row = next(x for x in c if x["product_id"] == fs["product_id"])
+    assert row["final_a"] is None
+
+
+def test_a02_zero_input_still_rejected(demo):
+    fs = _row("粉丝馅料")
+    r = client.put(f"/api/daily/{DAY}/production", json=[{**fs, "batches": "0"}])
+    assert r.status_code == 400
 
 
 def test_a02_engine_survives_zero_in_old_data(demo):

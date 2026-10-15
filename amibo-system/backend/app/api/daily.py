@@ -150,7 +150,7 @@ def need(v, label, name, positive=False, hint=""):
     return x
 
 
-SCRAP_HINT = "。如果当天整批报废，请清空这一行，并在异常清单里备注原因"
+# 产出可以填 0：表示整批报废（全损），记录保留，系统按全损提示，不出单位成本
 
 
 @router.put("/{day}/process")
@@ -163,7 +163,7 @@ def save_process(day: str, rows: list[dict] = Body(...), db: Session = Depends(g
             upsert(db, DailyMaterialProcess, d, "material_id", mid, None)
             continue
         q1 = need(r.get("qty1"), "1 级领用量", name, positive=True)
-        q2 = need(r.get("qty2"), "2 级称重", name, positive=True, hint="。当天没处理就把两格都清空")
+        q2 = need(r.get("qty2"), "2 级称重", name)
         upsert(db, DailyMaterialProcess, d, "material_id", mid, {"qty1": q1, "qty2": q2})
     return finish(db, d)
 
@@ -178,7 +178,7 @@ def save_production(day: str, rows: list[dict] = Body(...), db: Session = Depend
             upsert(db, DailyProduction, d, "product_id", pid, None)
             continue
         b = need(r.get("batches"), "锅数/机数", name, positive=True)
-        w = need(r.get("output_weight"), "出锅重/出机重", name, positive=True, hint=SCRAP_HINT)
+        w = need(r.get("output_weight"), "出锅重/出机重", name)
         upsert(db, DailyProduction, d, "product_id", pid, {"batches": b, "output_weight": w, "qty_in": None})
     return finish(db, d)
 
@@ -193,7 +193,7 @@ def save_sesame(day: str, rows: list[dict] = Body(...), db: Session = Depends(ge
             upsert(db, DailyProduction, d, "product_id", pid, None)
             continue
         q = need(r.get("qty_in"), "芝麻用量", name, positive=True)
-        w = need(r.get("output_weight"), "麻油产量", name, positive=True, hint=SCRAP_HINT)
+        w = need(r.get("output_weight"), "麻油产量", name)
         upsert(db, DailyProduction, d, "product_id", pid, {"qty_in": q, "output_weight": w, "batches": None})
     return finish(db, d)
 
@@ -207,8 +207,7 @@ def save_cooling(day: str, rows: list[dict] = Body(...), db: Session = Depends(g
             upsert(db, DailyCooling, d, "product_id", pid, None)
             continue
         upsert(db, DailyCooling, d, "product_id", pid,
-               {"cooled_weight": need(r["cooled_weight"], "打冷出机重", r.get("name") or pid,
-                                      positive=True, hint=SCRAP_HINT)})
+               {"cooled_weight": need(r["cooled_weight"], "打冷出机重", r.get("name") or pid)})
     return finish(db, d)
 
 
@@ -222,7 +221,7 @@ def save_packing(day: str, rows: list[dict] = Body(...), db: Session = Depends(g
         if empty(r.get("packed_weight")) and not bags:
             upsert(db, DailyPacking, d, "product_id", pid, None)
             continue
-        packed = need(r.get("packed_weight"), "包装入库量", name, positive=True, hint=SCRAP_HINT)
+        packed = need(r.get("packed_weight"), "包装入库量", name)
         pre = parse_dec(r.get("prepack_weight"), "包装前重量")
         if pre is not None and pre <= 0:
             raise HTTPException(400, f"{name}：包装前重量必须大于 0（留空则取上一环节产出）")

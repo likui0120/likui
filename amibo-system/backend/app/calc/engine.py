@@ -178,8 +178,8 @@ class DayCalc:
             r.source = "fixed"
         else:
             r.std = self.mat_std.get(mid) or None  # 0 视为没设
-            if rec is not None and rec.qty1 and rec.qty2:
-                r.actual = rec.qty2 / rec.qty1
+            if rec is not None and rec.qty1:
+                r.actual = rec.qty2 / rec.qty1  # 2 级称重为 0 = 全部损耗，出率 0，2 级单价算不出
                 r.source = "actual"
                 if r.std is None:
                     r.std = r.actual
@@ -241,14 +241,15 @@ class DayCalc:
     def calc_sesame_oil(self, rec: DailyProduction, p: Product) -> CalcProduct:
         std_row = self.prod_std.get(p.id)
         std = (std_row.cook_yield or None) if std_row else None
-        actual = div(rec.output_weight, rec.qty_in) or None  # 产量为 0 时出率无意义
+        actual = div(rec.output_weight, rec.qty_in)
         sesame = self.materials.get(p.source_material_id) if p.source_material_id else None
         price1 = self.prices.get(sesame.id) if sesame else None
         if sesame:
             self.material(sesame.id).used = True
         key = f"p:{p.id}:oil"
+        loss = actual == 0
         if actual is None:
-            self.issue("warning", key, p.name, "芝麻用量或麻油产量为 0，无法计算麻油出率和单价", "oil")
+            self.issue("warning", key, p.name, "芝麻用量为空或为 0，无法计算麻油出率和单价", "oil")
         if not std:
             std = None
         if std is None and actual is not None:
@@ -260,7 +261,13 @@ class DayCalc:
             self.issue("warning", key, p.name, "产品资料未指定芝麻原料，无法计算麻油单价", "oil")
         elif price1 is None:
             self.issue("warning", f"m:{sesame.id}:price", sesame.name, "缺芝麻 1 级单价，麻油不出成本")
-        cp.ok = price1 is not None and actual is not None
+        cp.ok = price1 is not None and bool(actual)
+        if loss:
+            cost = price1 * rec.qty_in if price1 is not None else None
+            cp.input_cost_actual = cp.input_cost_std = cost
+            self.issue("alert", f"p:{p.id}:loss", p.name,
+                       f"全损：芝麻 {rec.qty_in:.2f} 斤，麻油产量为 0" + (f"，损失原料成本 {cost:.2f} 元" if cost is not None else ""),
+                       "oil")
         if cp.ok:
             cp.input_cost_actual = cp.input_cost_std = price1 * rec.qty_in
             cp.out_price_actual = price1 / actual
@@ -286,9 +293,6 @@ class DayCalc:
         batches = rec.batches or ZERO
         if batches <= 0:
             self.issue("warning", f"p:{p.id}:cook", p.name, "锅数/机数为空或为 0，无法计算")
-            return cp
-        if not rec.output_weight:
-            self.issue("warning", f"p:{p.id}:cook", p.name, "出锅重/出机重为 0，无法计算出率和单价")
             return cp
 
         # ---- BOM 行单价
@@ -320,7 +324,8 @@ class DayCalc:
                 if r.price1 is None:
                     missing.append(f"{m.name}（1 级单价）")
                 elif r.p2a is None:
-                    missing.append(f"{m.name}（无处理记录也无标准出率）")
+                    missing.append(f"{m.name}（当天 1→2 级出率为 0）" if r.actual == 0
+                                   else f"{m.name}（无处理记录也无标准出率）")
                 kind = "原料" if m.needs_process else "原料(不处理)"
                 key = f"m:{m.id}" if m.needs_process and r.source == "actual" and r.actual != r.std else None
                 lines.append(Line(bl.line_no, m.name, kind, bl.qty, r.p2a, r.p2s, key=key, info={
@@ -344,6 +349,23 @@ class DayCalc:
         cp.cook_yield_actual, cp.cook_yield_std = cook_a, cook_s
         self.check_yield(f"p:{p.id}:cook", p.name, "cook", cook_a, cook_s, self.th.for_product(p.id, "cook"))
 
+        # ---- 整批报废：出锅重为 0。保留投入和损失，不出单位成本，后面环节不再计算
+        if cook_a == 0:
+            cost = None if missing else batches * sum(l.qty * l.pa for l in lines)
+            cp.input_cost_actual = cost
+            self.issue("alert", f"p:{p.id}:loss", p.name,
+                       f"全损：投料 {input_weight:.2f} 斤，出锅重/出机重为 0"
+                       + (f"，损失投料成本 {cost:.2f} 元" if cost is not None else "（缺单价，损失金额算不出）"), "cook")
+            for what, recs in (("制冷", self.cooling), ("包装", self.packing)):
+                if p.id in recs:
+                    self.issue("warning", f"p:{p.id}:loss", p.name, f"出锅重为 0 却有{what}记录，请核对")
+            cp.trace = {"kind": p.ptype, "status": "全损",
+                        "bom": {"id": bom.id, "effective_date": bom.effective_date.isoformat()},
+                        "batches": js(batches), "per_batch": js(per_batch), "loss_cost": js(cost),
+                        "lines": [{"line_no": l.line_no, "name": l.name, "kind": l.kind, "qty": js(l.qty),
+                                   "price_actual": js(l.pa), "price_std": js(l.ps), **l.info} for l in lines]}
+            return cp
+
         # ---- 制冷
         cool_a = cool_s = None
         if p.cooled:
@@ -353,6 +375,9 @@ class DayCalc:
                 cp.cooled_weight = crec.cooled_weight
                 cool_a = div(crec.cooled_weight, rec.output_weight)
                 cp.cool_source = "actual"
+                if cool_a == 0:
+                    self.issue("alert", f"p:{p.id}:loss", p.name,
+                               f"全损：出锅 {rec.output_weight:.2f} 斤，打冷出机重为 0，冷后和成品单价算不出", "cool")
                 if cool_s is None:
                     cool_s = cool_a
                     self.issue("warning", f"p:{p.id}:cool", p.name, "缺制冷标准出率，标准成本按实际出率计", "cool")
@@ -382,6 +407,9 @@ class DayCalc:
                 cp.prepack_weight = prec.prepack_weight if prec.prepack_weight is not None else default_pre
                 cp.packed_weight = prec.packed_weight
                 pack_a = div(prec.packed_weight, cp.prepack_weight)
+                if pack_a == 0:
+                    self.issue("alert", f"p:{p.id}:loss", p.name,
+                               f"全损：包装前 {cp.prepack_weight:.2f} 斤，包装入库量为 0，成品单价算不出", "pack")
                 if pack_s is None and pack_a is not None:
                     pack_s = pack_a
                     self.issue("warning", f"p:{p.id}:pack", p.name, "缺包装标准出率，标准成本按实际出率计", "pack")
@@ -541,7 +569,9 @@ class DayCalc:
                 price2_std=r.p2s, used=r.used,
             ))
             key = f"m:{m.id}:process"
-            if r.source == "actual":
+            if r.source == "actual" and r.actual == 0:
+                self.issue("alert", key, m.name, f"全损：1 级领用 {r.qty1:.2f} 斤，2 级称重为 0", "process")
+            elif r.source == "actual":
                 if r.std_missing:
                     self.issue("warning", key, m.name, "缺 1→2 级标准出率，标准成本按实际出率计", "process")
                 else:
