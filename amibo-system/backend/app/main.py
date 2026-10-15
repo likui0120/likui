@@ -54,12 +54,16 @@ def dashboard(day: str, db: Session = Depends(get_db)):
 
 
 DIST = Path(__file__).resolve().parents[2] / "frontend" / "dist"
+DIST_ROOT = DIST.resolve()
 if DIST.exists():
     app.mount("/assets", StaticFiles(directory=DIST / "assets"), name="assets")
 
     @app.get("/{path:path}", include_in_schema=False)
     def spa(path: str):
-        f = DIST / path
-        if path and f.is_file():
+        if path.startswith("api/"):
+            return JSONResponse(status_code=404, content={"detail": "没有这个接口"})
+        f = (DIST / path).resolve()
+        # 只给 dist 目录里的文件，防止用 ../ 读到数据库等其他文件
+        if path and f.is_file() and DIST_ROOT in f.parents:
             return FileResponse(f)
         return FileResponse(DIST / "index.html")
