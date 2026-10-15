@@ -10,6 +10,7 @@ from decimal import Decimal as D
 
 from sqlalchemy import select
 
+from . import models_import  # noqa: F401  让 --reset 也删建导入记录表
 from .calc.engine import recalc_from
 from .db import Base, SessionLocal, engine
 from .models import (
