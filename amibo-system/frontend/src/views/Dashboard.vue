@@ -9,7 +9,7 @@
 
     <el-empty v-if="d && !d.total_output && !d.products" description="这一天还没有录入数据">
       <el-button type="primary" @click="$router.push('/entry')">开始录入</el-button>
-      <el-button v-if="d.last_date" @click="store.day = d.last_date">看最近有数据的一天（{{ d.last_date }}）</el-button>
+      <el-button v-if="d.last_date" @click="goLast">看最近有数据的一天（{{ d.last_date }}）</el-button>
     </el-empty>
 
     <template v-else-if="d">
@@ -74,11 +74,23 @@ import { fmtM, fmtP, fmtQ, fmtT, fmtW } from '../fmt'
 
 const d = ref(null)
 const issues = ref([])
+let seq = 0
 async function load() {
   const day = store.day
-  d.value = await api.get('/api/dashboard', { day })
-  const r = await api.get('/api/reports/issues', { start: day, end: day })
+  const my = ++seq
+  const [dash, r] = await Promise.all([
+    api.get('/api/dashboard', { day }),
+    api.get('/api/reports/issues', { start: day, end: day }),
+  ])
+  if (my !== seq) return // 已切到别的日期，丢掉旧结果
+  d.value = dash
   issues.value = r.rows.map((x) => ({ ...x, object_name: x.name }))
+}
+function goLast() {
+  const target = d.value?.last_date
+  if (!target) return
+  if (store.day === target) load()
+  else store.day = target
 }
 watch(() => store.day, load, { immediate: true })
 </script>
