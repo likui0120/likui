@@ -1,0 +1,9 @@
+data/
+__pycache__/
+*.pyc
+.pytest_cache/
+frontend/node_modules/
+backend/.venv/
+
+# 根目录忽略了 dist/，这里的前端打包结果要进仓库（工厂电脑不用装 Node）
+!frontend/dist/
