@@ -162,23 +162,7 @@
 
         <!-- 原料单价 -->
         <el-tab-pane :label="`原料单价（${filledCount(data.prices, ['price'])}）${mark('prices')}`" name="prices">
-          <div class="upload-row">
-            <el-upload :auto-upload="false" :show-file-list="false" accept=".xlsx,.csv" :on-change="uploadTplus">
-              <el-button type="primary">上传 T+ 导出的 Excel</el-button>
-            </el-upload>
-            <span>表里没有“计量单位”列时，单价单位按</span>
-            <el-radio-group v-model="tplusUnit" size="small">
-              <el-radio-button value="jin">元/斤</el-radio-button>
-              <el-radio-button value="kg">元/公斤</el-radio-button>
-            </el-radio-group>
-            <el-button link type="primary" @click="download('/api/import/template/tplus')">样例格式</el-button>
-          </div>
-          <p class="hint">导入后单价记到当前选择的日期（{{ store.day }}）。按存货编码优先、名称其次匹配原料；同一原料多行时按金额 ÷ 数量加权。也可以在下面手工填写或修改（元/斤）。缺单价的产品不出成本，系统不会自动取旧价。</p>
-          <el-alert v-if="tplusResult" :type="tplusResult.unmatched.length || tplusResult.bad.length ? 'warning' : 'success'" :closable="true" @close="tplusResult = null" class="mb">
-            <template #title>导入 {{ tplusResult.matched.length }} 个原料的单价；{{ tplusResult.unmatched.length }} 行没匹配上{{ tplusResult.bad.length ? `，${tplusResult.bad.length} 行有问题` : '' }}</template>
-            <div v-for="u in tplusResult.unmatched" :key="'u' + u.row">第 {{ u.row }} 行：{{ u.code || '' }} {{ u.name }} 在原料资料里找不到（可在“基础资料 → 原料”里新增或补编码后重新导入）</div>
-            <div v-for="u in tplusResult.bad" :key="'b' + u.row">第 {{ u.row }} 行：{{ u.name }} {{ u.reason }}</div>
-          </el-alert>
+          <TplusImport :day="store.day" @imported="onImported" />
           <el-table :data="view(data.prices, ['price'])" border size="small" class="entry-table" max-height="calc(100vh - 380px)">
             <el-table-column prop="name" label="原料" min-width="140" />
             <el-table-column prop="code" label="编码" width="110" />
@@ -202,7 +186,8 @@ import { onBeforeRouteLeave } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import DayPicker from '../components/DayPicker.vue'
 import IssueBox from '../components/IssueBox.vue'
-import { api, download } from '../api'
+import { api } from '../api'
+import TplusImport from '../components/TplusImport.vue'
 import { store } from '../store'
 import { fmtQ, fmtW, fmtY } from '../fmt'
 
@@ -211,8 +196,6 @@ const kw = ref('')
 const onlyFilled = ref(false)
 const loading = ref(false)
 const saving = ref(false)
-const tplusUnit = ref('jin')
-const tplusResult = ref(null)
 const data = reactive({ process: [], production: [], sesame: [], cooling: [], packing: [], specs: [], meters: [], prices: [], issues: [] })
 
 // 每个页签各自记“有没有没保存的修改”。保存一个页签只覆盖这个页签，其他页签的草稿保留。
@@ -343,20 +326,6 @@ function onImported() {
   return load()
 }
 
-async function uploadTplus(file) {
-  const fd = new FormData()
-  fd.append('day', store.day)
-  fd.append('unit', tplusUnit.value)
-  fd.append('file', file.raw)
-  loading.value = true
-  try {
-    tplusResult.value = await api.post('/api/import/tplus', fd)
-    await onImported()
-  } finally {
-    loading.value = false
-  }
-}
-
 let lastDay = store.day
 let reverting = false
 watch(() => store.day, async (v) => {
@@ -371,7 +340,6 @@ watch(() => store.day, async (v) => {
     }
   }
   lastDay = v
-  tplusResult.value = null
   load({ clearAll: true })
 })
 load({ clearAll: true })

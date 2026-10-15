@@ -4,15 +4,18 @@ from __future__ import annotations
 import csv
 import io
 import re
+from datetime import datetime
 from decimal import Decimal
+from html.parser import HTMLParser
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 from openpyxl import Workbook, load_workbook
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from ..db import get_db
+from ..models_import import ImportBatch
 from ..models import (
     MATERIAL_CATEGORIES, PRODUCT_TYPES, TEAMS, Bom, BomLine, Material, MaterialPrice, MaterialStdYield, Product,
     ProductStdYield,
@@ -33,20 +36,105 @@ def norm(s) -> str:
     return re.sub(r"\s+", "", s)
 
 
-def read_rows(upload: UploadFile) -> list[list]:
-    data = upload.file.read()
-    name = (upload.filename or "").lower()
-    if name.endswith(".csv"):
-        text = data.decode("utf-8-sig", errors="replace")
-        return [row for row in csv.reader(io.StringIO(text))]
-    if name.endswith(".xls"):
-        raise HTTPException(400, "暂不支持旧版 .xls 文件，请在 Excel 里另存为 .xlsx 后再上传")
+OLE2 = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"  # 旧版 .xls（Excel 97-2003）文件头
+
+
+def decode_text(data: bytes) -> str:
+    """中文 Windows 上 Excel 另存的 CSV 多是 GBK 编码，先试 UTF-8，不行再按 GB18030。"""
+    for enc in ("utf-8-sig", "gb18030"):
+        try:
+            return data.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", errors="replace")
+
+
+class _TableParser(HTMLParser):
+    """有些系统导出的“.xls”其实是网页表格，按 <tr>/<td> 读出来。"""
+
+    def __init__(self):
+        super().__init__()
+        self.rows, self.row, self.buf, self.in_cell = [], None, [], False
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "tr":
+            self.row = []
+        elif tag in ("td", "th") and self.row is not None:
+            self.in_cell, self.buf = True, []
+
+    def handle_endtag(self, tag):
+        if tag in ("td", "th") and self.row is not None and self.in_cell:
+            self.row.append("".join(self.buf).strip() or None)
+            self.in_cell = False
+        elif tag == "tr" and self.row is not None:
+            self.rows.append(self.row)
+            self.row = None
+
+    def handle_data(self, data):
+        if self.in_cell:
+            self.buf.append(data)
+
+
+def _xls_rows(data: bytes) -> list[list]:
+    try:
+        import xlrd
+    except ImportError:
+        raise HTTPException(400, "这台电脑还没装读取 .xls 的组件（xlrd），请重新双击启动系统.bat 安装，"
+                                 "或先在 Excel 里另存为 .xlsx 再上传")
+
+    try:
+        book = xlrd.open_workbook(file_contents=data)
+    except Exception:
+        raise HTTPException(400, "这个 .xls 文件读不出来，请在 Excel 里另存为 .xlsx 后再上传")
+    sheets = [book.sheet_by_index(i) for i in range(book.nsheets)]
+    sheet = next((sh for sh in sheets if sh.nrows), sheets[0] if sheets else None)
+    if sheet is None:
+        return []
+    rows = []
+    for r in range(sheet.nrows):
+        out = []
+        for c in sheet.row(r):
+            v = c.value
+            if c.ctype == xlrd.XL_CELL_NUMBER and float(v).is_integer():
+                v = int(v)  # 编码列 1001 不要读成 1001.0
+            elif c.ctype in (xlrd.XL_CELL_EMPTY, xlrd.XL_CELL_BLANK):
+                v = None
+            out.append(v)
+        rows.append(out)
+    return rows
+
+
+def _xlsx_rows(data: bytes) -> list[list]:
     try:
         wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
     except Exception:
-        raise HTTPException(400, "文件无法读取，请确认是 .xlsx 或 .csv 文件")
-    ws = wb.worksheets[0]
-    return [list(r) for r in ws.iter_rows(values_only=True)]
+        raise HTTPException(400, "文件无法读取，请确认是 Excel（.xlsx/.xls）或 .csv 文件")
+    for ws in wb.worksheets:  # 取第一个有内容的工作表
+        rows = [list(r) for r in ws.iter_rows(values_only=True)]
+        if any(any(v is not None for v in r) for r in rows):
+            return rows
+    return []
+
+
+def read_rows(upload: UploadFile) -> list[list]:
+    """按文件内容判断格式（不只看扩展名）：.xlsx、旧版 .xls、网页表格、CSV。"""
+    data = upload.file.read()
+    if not data:
+        raise HTTPException(400, "文件是空的")
+    if data[:4] == b"PK\x03\x04":
+        return _xlsx_rows(data)
+    if data[:8] == OLE2:
+        return _xls_rows(data)
+    text = decode_text(data)
+    head = text.lstrip()[:2000].lower()
+    if head.startswith("<") and "<table" in text.lower():
+        p = _TableParser()
+        p.feed(text)
+        return p.rows
+    name = (upload.filename or "").lower()
+    if name.endswith((".xlsx", ".xls", ".xlsm")):
+        raise HTTPException(400, "文件无法读取，请确认是 Excel（.xlsx/.xls）或 .csv 文件")
+    return [row for row in csv.reader(io.StringIO(text))]
 
 
 def find_header(rows: list[list], must: list[list[str]], scan: int = 15):
@@ -110,13 +198,21 @@ def yes(v) -> bool:
 
 def pick_price_col(cells: list[str]):
     """单价列：优先“无税单价/不含税单价/单价”，其次含“单价”但不是含税单价的列，最后“价格”。"""
-    for exact in ("无税单价", "不含税单价", "单价"):
+    for exact in ("无税单价", "不含税单价", "未税单价", "单价"):
         if exact in cells:
             return cells.index(exact)
     for i, c in enumerate(cells):
         if "单价" in c and not ("含税" in c and "不含税" not in c):
             return i
     return col(cells, "单价", "价格")
+
+
+def tax_kind(header: str) -> str:
+    if any(k in header for k in ("不含税", "无税", "未税")):
+        return "不含税"
+    if "含税" in header or "价税" in header:
+        return "含税"
+    return "未注明"
 
 
 class Matcher:
@@ -129,35 +225,48 @@ class Matcher:
             self.by_name[norm(m.name)] = m
 
     def find(self, code, name):
-        if code and norm(code) in self.by_code:
-            return self.by_code[norm(code)]
-        if name and norm(name) in self.by_name:
-            return self.by_name[norm(name)]
-        return None
+        return self.match(code, name)[0]
+
+    def match(self, code, name):
+        """返回 (原料, 匹配方式, 需要核对的说明 or None)。编码优先，其次名称。"""
+        by_code = self.by_code.get(norm(code)) if code else None
+        by_name = self.by_name.get(norm(name)) if name else None
+        if by_code is not None:
+            if by_name is not None and by_name.id != by_code.id:
+                return by_code, "编码", f"编码 {code} 是“{by_code.name}”，但名称“{name}”是另一个原料，已按编码匹配，请核对"
+            return by_code, "编码", None
+        if by_name is not None:
+            if code and by_name.code and norm(by_name.code) != norm(code):
+                return by_name, "名称", f"T+ 编码 {code} 与原料资料里的编码 {by_name.code} 不一致，已按名称匹配"
+            return by_name, "名称", None
+        return None, None, None
 
 
 # ---------------------------------------------------------------- T+ 单价
 
-@router.post("/tplus")
-def import_tplus(day: str = Form(...), unit: str = Form("jin"), file: UploadFile = File(...),
-                 db: Session = Depends(get_db)):
-    """导入 T+ 导出的单价表。
+PRICE_JUMP = Decimal("0.3")  # 和上次单价相比变化超过 30% 时提示核对
 
-    自动找含“单价”和“名称/编码”的表头行。按编码优先、名称其次匹配原料。
-    同一原料出现多行时，有数量和金额列就按 Σ金额 ÷ Σ数量 加权，否则取最后一行。
-    单位：表里有“计量单位”列时按每行单位换算（公斤/千克/kg ÷ 2），否则按所选单位。
-    """
-    d = parse_date(day)
-    rows = read_rows(file)
+
+def _price_cols(cells: list[str]) -> list[int]:
+    return [i for i, c in enumerate(cells) if c and ("单价" in c or c == "价格") and "金额" not in c]
+
+
+def parse_tplus(db: Session, d, rows: list[list], unit: str, price_col: str | None):
+    """读 T+ 表，算出每个原料当天的 1 级单价（元/斤），并和已有单价比较。不写库。"""
     hi, cells = find_header(rows, [["单价", "价格"], ["名称", "编码", "编号"]])
     if hi is None:
         raise HTTPException(400, "没找到表头，请确认表里有“单价”列和“存货名称/存货编码”列")
-    c_price = pick_price_col(cells)
+    candidates = _price_cols(cells)
+    if price_col:
+        if norm(price_col) not in cells:
+            raise HTTPException(400, f"表里没有“{price_col}”这一列")
+        c_price = cells.index(norm(price_col))
+    else:
+        c_price = pick_price_col(cells)
     c_code = col(cells, "存货编码", "编码", "编号")
     c_name = col(cells, "存货名称", "名称")
-    c_unit = col(cells, "计量单位", "单位")
-    c_qty = col(cells, "数量")
-    c_amt = col(cells, "金额", exclude=("税额",))
+    c_unit = col(cells, "计量单位", "主计量", "单位")
+    c_qty = col(cells, "数量", exclude=("单价", "金额"))
     matcher = Matcher(db)
     agg: dict[int, dict] = {}
     unmatched, bad = [], []
@@ -165,41 +274,210 @@ def import_tplus(day: str = Form(...), unit: str = Form("jin"), file: UploadFile
         code, name, price = cell(row, c_code), cell(row, c_name), num(cell(row, c_price))
         if not code and not name:
             continue
-        if name and ("合计" in str(name) or "小计" in str(name)):
+        if any(k in str(name or "") + str(code or "") for k in ("合计", "小计", "总计")):
             continue
-        u = norm(cell(row, c_unit)) if c_unit is not None else ("kg" if unit == "kg" else "斤")
-        factor = Decimal("0.5") if u.lower() in ("kg", "公斤", "千克") else Decimal(1)
-        if u and u not in ("斤", "kg", "KG", "Kg", "公斤", "千克") and c_unit is not None:
+        code = str(code).strip() if code is not None else None
+        u = norm(cell(row, c_unit)) if c_unit is not None else ""
+        u = u or ("kg" if unit == "kg" else "斤")
+        if u.lower() in ("kg", "公斤", "千克"):
+            factor = Decimal("0.5")  # 元/公斤 → 元/斤
+        elif u in ("斤", "市斤"):
+            factor = Decimal(1)
+        else:
             bad.append({"row": ri, "code": code, "name": name, "reason": f"计量单位“{u}”无法换算成斤，已跳过"})
             continue
-        m = matcher.find(code, name)
+        m, how, note = matcher.match(code, name)
         if m is None:
             unmatched.append({"row": ri, "code": code, "name": name, "price": str(price) if price is not None else None})
             continue
         if price is None:
             bad.append({"row": ri, "code": code, "name": name, "reason": "单价为空"})
             continue
-        a = agg.setdefault(m.id, {"m": m, "rows": 0, "qty": Decimal(0), "amt": Decimal(0), "last": None})
-        a["rows"] += 1
-        a["last"] = price * factor
-        q, amt = num(cell(row, c_qty)), num(cell(row, c_amt))
-        if q and amt is not None:
-            a["qty"] += q / factor  # 换成斤
-            a["amt"] += amt
-    existing = {r.material_id: r for r in db.scalars(select(MaterialPrice).where(MaterialPrice.date == d))}
-    matched = []
+        if price <= 0:
+            bad.append({"row": ri, "code": code, "name": name, "reason": f"单价 {price} 不是正数，已跳过"})
+            continue
+        a = agg.setdefault(m.id, {"m": m, "how": how, "notes": [], "rows": [], "file_names": set(),
+                                  "qty": Decimal(0), "amt": Decimal(0), "prices": [], "no_qty": False})
+        if note and note not in a["notes"]:
+            a["notes"].append(note)
+        a["rows"].append(ri)
+        if name:
+            a["file_names"].add(str(name).strip())
+        p_jin = price * factor
+        a["prices"].append(p_jin)
+        q = num(cell(row, c_qty))
+        if q and q > 0:
+            q_jin = q / factor  # 公斤 → 斤
+            a["qty"] += q_jin
+            a["amt"] += q_jin * p_jin
+        else:
+            a["no_qty"] = True
+
+    ids = list(agg)
+    existing = {r.material_id: r for r in db.scalars(
+        select(MaterialPrice).where(MaterialPrice.date == d, MaterialPrice.material_id.in_(ids)))} if ids else {}
+    prev = {}
+    if ids:
+        sub = (select(MaterialPrice.material_id, func.max(MaterialPrice.date).label("d"))
+               .where(MaterialPrice.date < d, MaterialPrice.material_id.in_(ids))
+               .group_by(MaterialPrice.material_id).subquery())
+        stmt = select(MaterialPrice).join(sub, (MaterialPrice.material_id == sub.c.material_id)
+                                          & (MaterialPrice.date == sub.c.d))
+        prev = {r.material_id: r for r in db.scalars(stmt)}
+
+    items = []
     for mid, a in agg.items():
-        price = a["amt"] / a["qty"] if a["rows"] > 1 and a["qty"] else a["last"]
+        m = a["m"]
+        notes, info = list(a["notes"]), []  # notes 需要核对，info 只是说明
+        if len(a["rows"]) > 1 and not a["no_qty"] and a["qty"]:
+            price = a["amt"] / a["qty"]
+            if len(set(a["prices"])) > 1:
+                info.append(f"{len(a['rows'])} 行单价不同，按数量加权平均")
+        else:
+            price = a["prices"][-1]
+            if len(set(a["prices"])) > 1:
+                notes.append(f"{len(a['rows'])} 行单价不同且缺数量，取最后一行")
+        old = existing.get(mid)
+        pv = prev.get(mid)
+        change = None
+        if pv is not None and pv.price:
+            change = price / pv.price - 1
+            if abs(change) > PRICE_JUMP:
+                hint = ""
+                ratio_ = price / pv.price
+                if Decimal("1.9") <= ratio_ <= Decimal("2.1") or Decimal("0.475") <= ratio_ <= Decimal("0.525"):
+                    hint = "，接近 2 倍关系，可能是公斤和斤弄混了"
+                notes.append(f"比上次（{pv.date.isoformat()}）{'涨' if change > 0 else '降'}了 "
+                             f"{abs(change) * 100:.1f}%{hint}")
+        if old is not None and old.price != price:
+            if (old.source or "").startswith("T+"):
+                notes.append(f"会覆盖当天之前导入的单价 {old.price}")
+            else:
+                notes.append(f"会覆盖当天{old.source or '已有'}填写的单价 {old.price}")
+        items.append({
+            "material_id": mid, "name": m.name, "code": m.code, "category": m.category,
+            "file_names": sorted(a["file_names"] - {m.name}), "match": a["how"], "rows": a["rows"],
+            "price": str(price), "qty": str(a["qty"]) if a["qty"] else None,
+            "old_price": str(old.price) if old is not None else None,
+            "old_source": old.source if old is not None else None,
+            "prev_price": str(pv.price) if pv is not None else None,
+            "prev_date": pv.date.isoformat() if pv is not None else None,
+            "change": str(change) if change is not None else None,
+            "notes": notes, "info": info,
+        })
+    items.sort(key=lambda x: (not x["notes"], x["rows"][0]))
+    price_header = cells[c_price] if c_price is not None else None
+    return {
+        "header_row": hi + 1,
+        "columns": {k: (cells[v] if v is not None else None) for k, v in
+                    (("code", c_code), ("name", c_name), ("unit", c_unit), ("qty", c_qty), ("price", c_price))},
+        "price_col": price_header,
+        "price_tax": tax_kind(price_header or ""),
+        "price_cols": [{"name": cells[i], "tax": tax_kind(cells[i])} for i in candidates],
+        "unit_default": None if c_unit is not None else ("元/公斤" if unit == "kg" else "元/斤"),
+        "items": items, "unmatched": unmatched, "bad": bad,
+        "flagged": sum(1 for x in items if x["notes"]),
+    }
+
+
+@router.post("/tplus")
+def import_tplus(day: str = Form(...), unit: str = Form("jin"), file: UploadFile = File(...),
+                 preview: bool = Form(False), price_col: str | None = Form(None),
+                 db: Session = Depends(get_db)):
+    """导入 T+ 导出的单价表。preview=true 只预览不保存。
+
+    自动找含“单价”和“名称/编码”的表头行。按编码优先、名称其次匹配原料。
+    单价列默认优先取不含税单价，可用 price_col 指定。
+    同一原料出现多行时按数量加权（Σ 数量×单价 ÷ Σ 数量），缺数量时取最后一行。
+    单位：表里有“计量单位”列时按每行单位换算（公斤/千克/kg 的单价 ÷ 2），否则按所选单位。
+    确认导入时记一条导入批次，可在导入记录里撤销。
+    """
+    d = parse_date(day)
+    rows = read_rows(file)
+    res = parse_tplus(db, d, rows, unit, price_col)
+    res["file"] = file.filename
+    if preview:
+        return res
+    if not res["items"]:
+        raise HTTPException(400, "没有可导入的单价：没有一行匹配上原料")
+    batch = ImportBatch(kind="tplus", date=d, filename=file.filename, price_col=res["price_col"],
+                        matched=len(res["items"]), unmatched=len(res["unmatched"]), flagged=res["flagged"])
+    db.add(batch)
+    db.flush()
+    src = f"T+#{batch.id}：{file.filename}"[:255]
+    existing = {r.material_id: r for r in db.scalars(select(MaterialPrice).where(MaterialPrice.date == d))}
+    detail = []
+    for it in res["items"]:
+        mid, price = it["material_id"], Decimal(it["price"])
         row = existing.get(mid)
-        src = f"T+:{file.filename}"
+        detail.append({"material_id": mid, "name": it["name"], "new_price": it["price"],
+                       "old_price": str(row.price) if row is not None else None,
+                       "old_source": row.source if row is not None else None})
         if row is None:
             db.add(MaterialPrice(material_id=mid, date=d, price=price, source=src))
         else:
             row.price, row.source = price, src
-        matched.append({"material_id": mid, "name": a["m"].name, "price": str(price), "rows": a["rows"]})
+    batch.detail = detail
     flush_or_400(db)
-    summary = recalc_after(db, d)
-    return {"matched": matched, "unmatched": unmatched, "bad": bad, "recalc": summary}
+    res["batch_id"] = batch.id
+    res["recalc"] = recalc_after(db, d)
+    # 旧字段，兼容之前的页面
+    res["matched"] = [{"material_id": x["material_id"], "name": x["name"], "price": x["price"], "rows": len(x["rows"])}
+                      for x in res["items"]]
+    return res
+
+
+def batch_dict(b: ImportBatch) -> dict:
+    return {"id": b.id, "kind": b.kind, "date": b.date.isoformat(), "filename": b.filename,
+            "created_at": b.created_at.isoformat(timespec="seconds") if b.created_at else None,
+            "price_col": b.price_col, "matched": b.matched, "unmatched": b.unmatched, "flagged": b.flagged,
+            "undone_at": b.undone_at.isoformat(timespec="seconds") if b.undone_at else None}
+
+
+@router.get("/batches")
+def list_batches(day: str | None = None, limit: int = 50, db: Session = Depends(get_db)):
+    stmt = select(ImportBatch).order_by(ImportBatch.id.desc()).limit(min(max(limit, 1), 500))
+    if day:
+        stmt = stmt.where(ImportBatch.date == parse_date(day))
+    return [batch_dict(b) for b in db.scalars(stmt)]
+
+
+@router.get("/batches/{bid}")
+def get_batch(bid: int, db: Session = Depends(get_db)):
+    b = db.get(ImportBatch, bid)
+    if b is None:
+        raise HTTPException(404, "没有这条导入记录")
+    return {**batch_dict(b), "detail": b.detail or []}
+
+
+@router.post("/batches/{bid}/undo")
+def undo_batch(bid: int, db: Session = Depends(get_db)):
+    """撤销一次 T+ 导入：把这次导入写的单价恢复成导入前的值（导入前没有就删掉）。
+
+    导入之后又被手工改过或被别的导入覆盖的原料不动，列出来。
+    """
+    b = db.get(ImportBatch, bid)
+    if b is None:
+        raise HTTPException(404, "没有这条导入记录")
+    if b.undone_at is not None:
+        raise HTTPException(400, "这次导入已经撤销过了")
+    prefix = f"T+#{b.id}："
+    current = {r.material_id: r for r in db.scalars(select(MaterialPrice).where(MaterialPrice.date == b.date))}
+    restored, skipped = [], []
+    for it in b.detail or []:
+        row = current.get(it["material_id"])
+        if row is None or not (row.source or "").startswith(prefix):
+            skipped.append({"name": it["name"], "reason": "导入后已被修改或删除，没有撤销"})
+            continue
+        if it.get("old_price") is None:
+            db.delete(row)
+        else:
+            row.price, row.source = Decimal(it["old_price"]), it.get("old_source")
+        restored.append(it["name"])
+    b.undone_at = datetime.now()
+    flush_or_400(db)
+    summary = recalc_after(db, b.date)
+    return {"restored": restored, "skipped": skipped, "recalc": summary}
 
 
 # ---------------------------------------------------------------- 原料清单

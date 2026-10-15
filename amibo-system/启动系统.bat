@@ -19,7 +19,7 @@ echo 使用的 Python：%PY%
 if errorlevel 1 goto fail
 
 :check_deps
-.venv\Scripts\python -c "import fastapi, uvicorn, sqlalchemy, openpyxl, python_multipart" >nul 2>nul
+.venv\Scripts\python -c "import fastapi, uvicorn, sqlalchemy, openpyxl, python_multipart, xlrd" >nul 2>nul
 if not errorlevel 1 goto run
 .venv\Scripts\python -m pip install -r requirements.txt
 if errorlevel 1 goto fail
