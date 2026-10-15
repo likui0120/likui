@@ -14,6 +14,7 @@ from .api.common import parse_date
 from .db import Base, SessionLocal, engine, get_db, migrate
 from .models import CalcEnergy, CalcIssue, CalcProduct, Product
 
+backup.backup_before_upgrade(Base.metadata)  # 要加表/加列时先备份旧库
 Base.metadata.create_all(engine)
 if migrate(engine, Base.metadata):
     # 加了新列（如计算结果的数据质量），把已有日期重算一遍填上

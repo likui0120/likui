@@ -89,3 +89,16 @@ def test_corrupt_backup_rejected(demo):
     bad.write_bytes(b"not a database" * 100)
     assert client.post(f"/api/backups/{bad.name}/restore").status_code == 400
 
+
+
+def test_backup_before_upgrade(demo):
+    clean()
+    from app.db import Base, engine
+    from sqlalchemy import text
+    assert backup.backup_before_upgrade(Base.metadata) is None  # 表结构齐全，不用备份
+    with engine.begin() as c:
+        c.execute(text("DROP TABLE import_batch"))
+    name = backup.backup_before_upgrade(Base.metadata)
+    assert name and name.endswith("-before-upgrade.db")
+    assert backup.list_backups()[0]["reason_text"] == "升级前"
+    Base.metadata.create_all(engine)

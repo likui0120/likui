@@ -31,8 +31,8 @@ CONFIG_FILE = DATA_DIR / "backup.json"
 KEEP_AUTO = 30  # 自动备份保留份数
 KEEP_MANUAL = 30  # 手动备份、恢复前备份保留份数
 CHECK_EVERY = 30 * 60  # 后台每 30 分钟看一次今天备份了没有
-NAME_RE = re.compile(r"^amibo-(\d{8})-(\d{6})-(auto|manual|before-restore)\.db$")
-REASONS = {"auto": "自动", "manual": "手动", "before-restore": "恢复前"}
+NAME_RE = re.compile(r"^amibo-(\d{8})-(\d{6})-(auto|manual|before-restore|before-upgrade)\.db$")
+REASONS = {"auto": "自动", "manual": "手动", "before-restore": "恢复前", "before-upgrade": "升级前"}
 
 _lock = threading.Lock()
 router = APIRouter(prefix="/api/backups")
@@ -151,6 +151,28 @@ def auto_backup_once():
             log.info("自动备份：%s", info["name"])
     except Exception:  # 备份失败不能影响系统运行
         log.exception("自动备份失败")
+
+
+def backup_before_upgrade(metadata) -> str | None:
+    """新版程序要给旧数据库加表或加列时，先备份一份（升级前），升级出问题可以恢复。返回备份文件名。"""
+    try:
+        src = db_path()
+        if src is None or not src.exists():
+            return None
+        from sqlalchemy import inspect
+
+        insp = inspect(engine)
+        existing = set(insp.get_table_names())
+        if not existing:
+            return None  # 新库，不用备份
+        for t in metadata.sorted_tables:
+            if t.name not in existing or {c.name for c in t.columns} - {c["name"] for c in insp.get_columns(t.name)}:
+                name = make_backup("before-upgrade")["name"]
+                log.info("升级前备份：%s", name)
+                return name
+    except Exception:  # 备份失败不能挡住启动
+        log.exception("升级前备份失败")
+    return None
 
 
 _stop = threading.Event()
