@@ -7,6 +7,7 @@ export const menu = [
     title: '报表', icon: 'DataAnalysis', children: [
       { path: '/r/yield', title: '出率日报', component: () => import('./views/reports/YieldReport.vue') },
       { path: '/r/cost', title: '成本日报', component: () => import('./views/reports/CostReport.vue') },
+      { path: '/r/monthly', title: '月度汇总', component: () => import('./views/reports/Monthly.vue') },
       { path: '/r/trace', title: '成本链路查询', component: () => import('./views/reports/TraceReport.vue') },
       { path: '/r/issues', title: '异常清单', component: () => import('./views/reports/IssueList.vue') },
       { path: '/r/energy-daily', title: '能耗日报', component: () => import('./views/reports/EnergyDaily.vue') },

@@ -500,3 +500,234 @@ def export(name: str, start: str | None = None, end: str | None = None, month: s
     else:
         raise HTTPException(404, "没有这个报表")
     return respond(table_xlsx(rep["title"], rep["columns"], rep["rows"], sub), f"{rep['title']}_{sub}")
+
+
+# ---------------------------------------------------------------- 月度汇总
+
+def month_range(month: str):
+    try:
+        y, m = (int(x) for x in month.split("-"))
+        st = date(y, m, 1)
+    except Exception:
+        raise HTTPException(400, "月份格式应为 YYYY-MM")
+    return st, date(y, m, calendar.monthrange(y, m)[1])
+
+
+def _ratio(a, b):
+    return a / b if a is not None and b else None
+
+
+def _cost_basis(p: Product, r: CalcProduct):
+    """月度汇总按哪一级单价和重量计：与成本差额口径一致（成品看成品，半成品油看冷后，其他看出机）。
+
+    类型、是否制冷/包装按计算当天的设置（结果里存了），没存的旧结果用资料里的当前值。
+    """
+    ptype = r.ptype or p.ptype
+    packed = p.packed if r.packed is None else r.packed
+    cooled = p.cooled if r.cooled is None else r.cooled
+    if ptype == "成品馅" and packed:
+        return r.final_price_actual, r.final_price_std, r.packed_weight
+    if ptype != "麻油" and cooled:
+        return r.cooled_price_actual, r.cooled_price_std, r.cooled_weight
+    return r.out_price_actual, r.out_price_std, r.output_weight
+
+
+def _product_month(db: Session, st: date, e: date, prods: dict, loss: set = frozenset()):
+    out: dict[int, dict] = {}
+    for r in db.scalars(select(CalcProduct).where(CalcProduct.date >= st, CalcProduct.date <= e)):
+        p = prods[r.product_id]
+        a = out.setdefault(p.id, {"days": 0, "cost_days": 0, "weight": Decimal(0), "cost_weight": Decimal(0),
+                                  "cost_a": Decimal(0), "cost_s": Decimal(0), "diff_amount": Decimal(0),
+                                  "in_w": Decimal(0), "out_w": Decimal(0), "in_w_std": Decimal(0), "out_w_std": Decimal(0),
+                                  "loss_days": 0, "loss_cost": Decimal(0), "input_cost": Decimal(0)})
+        a["days"] += 1
+        pa, ps, w = _cost_basis(p, r)
+        if w is not None:
+            a["weight"] += w
+        if pa is not None and ps is not None and w:
+            a["cost_days"] += 1
+            a["cost_weight"] += w
+            a["cost_a"] += pa * w
+            a["cost_s"] += ps * w
+        if r.diff_amount is not None:
+            a["diff_amount"] += r.diff_amount
+        if r.input_cost_actual is not None:
+            a["input_cost"] += r.input_cost_actual
+        if r.input_weight and r.output_weight is not None:
+            a["in_w"] += r.input_weight
+            a["out_w"] += r.output_weight
+            if r.cook_yield_std is not None:
+                a["in_w_std"] += r.input_weight
+                a["out_w_std"] += r.input_weight * r.cook_yield_std
+        if (p.id, r.date) in loss or (r.quality or {}).get("status") == "loss":
+            # 任一环节产出为 0 的整批报废，损失按当天投料成本计
+            a["loss_days"] += 1
+            if r.input_cost_actual is not None:
+                a["loss_cost"] += r.input_cost_actual
+    for a in out.values():
+        a["price_a"] = _ratio(a["cost_a"], a["cost_weight"])
+        a["price_s"] = _ratio(a["cost_s"], a["cost_weight"])
+        a["yield_a"] = _ratio(a["out_w"], a["in_w"])
+        a["yield_s"] = _ratio(a["out_w_std"], a["in_w_std"])
+    return out
+
+
+def monthly_report(db: Session, month: str):
+    """月度汇总：各产品月产量、按产量加权的实际/标准单价和月差额，各原料月出率和出率偏差金额。
+
+    月度单价 = Σ（每天单价 × 当天计价重量）÷ Σ 计价重量，即月总成本 ÷ 月总产量，不是日单价的简单平均；
+    月出率 = Σ 产出 ÷ Σ 投入；月标准出率按投入量加权。
+    """
+    st, e = month_range(month)
+    pst, pe = month_range((st - timedelta(days=1)).strftime("%Y-%m"))
+    prods = {p.id: p for p in db.scalars(select(Product))}
+    mats = {m.id: m for m in db.scalars(select(Material))}
+    alerts: dict[str, set] = {}
+    loss = set()
+    for i in db.scalars(select(CalcIssue).where(CalcIssue.date >= st, CalcIssue.date <= e, CalcIssue.kind == "alert")):
+        parts = i.item_key.split(":")
+        if len(parts) >= 2:
+            alerts.setdefault(f"{parts[0]}:{parts[1]}", set()).add(i.date)
+            if parts[0] == "p" and parts[-1] == "loss":
+                loss.add((int(parts[1]), i.date))
+
+    cur, prev = _product_month(db, st, e, prods, loss), _product_month(db, pst, pe, prods)
+    products = []
+    for pid, a in cur.items():
+        p = prods[pid]
+        pv = prev.get(pid, {}).get("price_a")
+        products.append({
+            "product_id": pid, "name": p.name, "ptype": p.ptype, "team": p.team,
+            "days": a["days"], "no_cost_days": a["days"] - a["cost_days"], "alert_days": len(alerts.get(f"p:{pid}", ())),
+            "weight": s(a["weight"]), "input_cost": s(a["input_cost"]),
+            "price_a": s(a["price_a"]), "price_s": s(a["price_s"]),
+            "diff_price": s(a["price_a"] - a["price_s"]) if a["price_a"] is not None and a["price_s"] is not None else None,
+            "diff_amount": s(a["diff_amount"]),
+            "prev_price_a": s(pv), "price_change": s(a["price_a"] / pv - 1) if a["price_a"] is not None and pv else None,
+            "yield_a": s(a["yield_a"]), "yield_s": s(a["yield_s"]), "yield_dev": s(dev_pp(a["yield_a"], a["yield_s"])),
+            "loss_days": a["loss_days"], "loss_cost": s(a["loss_cost"]) if a["loss_days"] else None,
+        })
+    products.sort(key=lambda x: (-abs(Decimal(x["diff_amount"] or 0)), x["name"]))
+
+    mrows: dict[int, dict] = {}
+    for r in db.scalars(select(CalcMaterial).where(CalcMaterial.date >= st, CalcMaterial.date <= e)):
+        m = mats.get(r.material_id)
+        if m is None:
+            continue
+        if not (m.needs_process if r.needs_process is None else r.needs_process):  # 按计算当天的设置
+            continue
+        a = mrows.setdefault(m.id, {"days": 0, "std_days": 0, "q1": Decimal(0), "q2": Decimal(0), "q1_std": Decimal(0),
+                                    "q2_std": Decimal(0), "impact": Decimal(0), "impact_days": 0})
+        if r.yield_source == "actual" and r.qty1:
+            a["days"] += 1
+            a["q1"] += r.qty1
+            a["q2"] += r.qty2 or 0
+            if r.std_yield:
+                a["q1_std"] += r.qty1
+                a["q2_std"] += r.qty1 * r.std_yield
+                if r.price1 is not None:
+                    # 同样的 2 级产出，按标准出率只需要 qty2 ÷ 标准出率 的 1 级原料，多用的部分折成金额
+                    a["impact"] += r.price1 * (r.qty1 - (r.qty2 or 0) / r.std_yield)
+                    a["impact_days"] += 1
+        elif r.used and r.yield_source in ("std", "missing"):
+            a["std_days"] += 1
+    materials = []
+    for mid, a in mrows.items():
+        m = mats[mid]
+        ya, ys = _ratio(a["q2"], a["q1"]), _ratio(a["q2_std"], a["q1_std"])
+        materials.append({
+            "material_id": mid, "name": m.name, "category": m.category, "days": a["days"],
+            "std_days": a["std_days"], "alert_days": len(alerts.get(f"m:{mid}", ())),
+            "qty1": s(a["q1"]) if a["days"] else None, "qty2": s(a["q2"]) if a["days"] else None,
+            "yield_a": s(ya), "yield_s": s(ys), "yield_dev": s(dev_pp(ya, ys)),
+            "impact": s(a["impact"]) if a["impact_days"] else None,
+        })
+    materials.sort(key=lambda x: (-abs(Decimal(x["impact"] or 0)), x["name"]))
+
+    energy = list(db.scalars(select(CalcEnergy).where(CalcEnergy.date >= st, CalcEnergy.date <= e)))
+    out_total = sum((r.total_output or 0 for r in energy), start=Decimal(0))
+    tons = out_total / 2000 if out_total else None
+    usage = {k: sum((Decimal(r.data["summary"][k]["plant"]) for r in energy
+                     if r.data.get("summary", {}).get(k, {}).get("plant") is not None), start=Decimal(0))
+             for k in ENERGIES}
+    energy_cost = sum((Decimal(r.data["cost_total"]) for r in energy if r.data.get("cost_total") is not None),
+                      start=Decimal(0))
+    summary = {
+        "production_days": sum(1 for r in energy if r.total_output),
+        "output": s(out_total), "output_ton": s(tons),
+        "diff_amount": s(sum((Decimal(x["diff_amount"]) for x in products if x["diff_amount"] is not None),
+                             start=Decimal(0))),
+        "material_impact": s(sum((Decimal(x["impact"]) for x in materials if x["impact"] is not None), start=Decimal(0))),
+        "loss_cost": s(sum((Decimal(x["loss_cost"]) for x in products if x["loss_cost"] is not None), start=Decimal(0))),
+        "energy_cost": s(energy_cost),
+        "energy_per_ton": {k: s(usage[k] / tons) if tons else None for k in ENERGIES},
+        "energy_cost_per_ton": s(energy_cost / tons) if tons else None,
+        "alert_days": len({d for ds in alerts.values() for d in ds}),
+    }
+    return {"title": f"月度汇总 {month}", "month": month, "start": st.isoformat(), "end": e.isoformat(),
+            "prev_month": pst.strftime("%Y-%m"), "summary": summary, "products": products, "materials": materials,
+            "product_columns": MONTH_PRODUCT_COLS, "material_columns": MONTH_MATERIAL_COLS}
+
+
+MONTH_PRODUCT_COLS = [
+    ("name", "产品", "text"), ("ptype", "类型", "text"), ("team", "班组", "text"), ("days", "生产天数", "text"),
+    ("weight", "月产量(斤)", "weight"), ("price_a", "实际单价(元/斤)", "price"), ("price_s", "标准单价(元/斤)", "price"),
+    ("diff_price", "差额(元/斤)", "price"), ("diff_amount", "月差额(元)", "money"),
+    ("prev_price_a", "上月实际单价", "price"), ("price_change", "比上月", "yield"),
+    ("yield_a", "熟制出率·实际", "yield"), ("yield_s", "熟制出率·标准", "yield"), ("yield_dev", "偏差(百分点)", "pp"),
+    ("alert_days", "超限天数", "text"), ("no_cost_days", "未出成本天数", "text"),
+    ("loss_days", "全损次数", "text"), ("loss_cost", "全损金额(元)", "money"),
+]
+MONTH_MATERIAL_COLS = [
+    ("name", "原料", "text"), ("category", "类别", "text"), ("days", "处理天数", "text"),
+    ("qty1", "1级领用(斤)", "weight"), ("qty2", "2级称重(斤)", "weight"),
+    ("yield_a", "月出率·实际", "yield"), ("yield_s", "月出率·标准", "yield"), ("yield_dev", "偏差(百分点)", "pp"),
+    ("impact", "出率偏差金额(元)", "money"), ("alert_days", "超限天数", "text"), ("std_days", "缺处理记录天数", "text"),
+]
+
+
+@router.get("/monthly")
+def get_monthly(month: str, db: Session = Depends(get_db)):
+    return monthly_report(db, month)
+
+
+def _fill_sheet(ws, title: str, columns, rows, sub: str):
+    """和 table_xlsx 一样的表格样式，写进指定的工作表（月度汇总一个文件两张表）。"""
+    ws.append([title + (f"（{sub}）" if sub else "")])
+    ws["A1"].font = Font(bold=True, size=14)
+    ws.append([c[1] for c in columns])
+    for i in range(1, len(columns) + 1):
+        c = ws.cell(2, i)
+        c.fill, c.font = HEAD_FILL, Font(bold=True)
+        c.alignment = Alignment(horizontal="center", wrap_text=True)
+        ws.column_dimensions[c.column_letter].width = 14 if columns[i - 1][2] != "text" else 18
+    for r in rows:
+        ws.append([to_cell(r.get(k), t) for k, _, t in columns])
+        for i, (k, _, t) in enumerate(columns, start=1):
+            if t in FMT:
+                ws.cell(ws.max_row, i).number_format = FMT[t]
+        if r.get("alert_days"):
+            for i in range(1, len(columns) + 1):
+                ws.cell(ws.max_row, i).font = RED
+    ws.freeze_panes = "A3"
+
+
+@router.get("/monthly/export")
+def export_monthly(month: str, db: Session = Depends(get_db)):
+    rep = monthly_report(db, month)
+    sub = f"{rep['start']} 至 {rep['end']}"
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "产品"
+    _fill_sheet(ws, rep["title"] + " · 产品", rep["product_columns"], rep["products"], sub)
+    sm = rep["summary"]
+    ws.append([])
+    for label, v, fmt in [("月总产量(斤)", sm["output"], "0.00"), ("生产天数", sm["production_days"], "0"),
+                          ("成本差额合计(元)", sm["diff_amount"], "0.00"), ("原料出率偏差金额合计(元)", sm["material_impact"], "0.00"),
+                          ("全损金额合计(元)", sm["loss_cost"], "0.00"), ("能耗费用合计(元)", sm["energy_cost"], "0.00"),
+                          ("吨产品能耗费用(元/吨)", sm["energy_cost_per_ton"], "0.00")]:
+        ws.append([label, to_cell(v, "money")])
+        ws.cell(ws.max_row, 1).font = Font(bold=True)
+        ws.cell(ws.max_row, 2).number_format = fmt
+    _fill_sheet(wb.create_sheet("原料出率"), rep["title"] + " · 原料出率", rep["material_columns"], rep["materials"], sub)
+    return respond(wb, rep["title"])
